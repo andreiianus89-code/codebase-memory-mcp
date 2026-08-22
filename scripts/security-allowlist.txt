@@ -39,6 +39,7 @@ src/watcher/watcher.c:popen:via cbm_popen wrapper calls
 # ── Git context: git metadata resolution (repo paths validated via cbm_validate_shell_arg) ──
 src/git/git_context.c:cbm_popen:git rev-parse/symbolic-ref/merge-base metadata lookup
 src/git/git_context.c:popen:via cbm_popen wrapper call
+src/git/git_context.c:fork:trusted Git execve uses a pinned executable, fixed environment, bounded output, timeout, and process-group cleanup
 
 # ── MCP server: search and change detection ────────────────────────────────
 src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validated)
