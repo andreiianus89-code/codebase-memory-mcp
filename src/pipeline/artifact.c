@@ -32,6 +32,7 @@ enum {
 #include "foundation/sha256.h"
 #include "foundation/str_util.h" /* cbm_validate_shell_arg — git shell-out hardening */
 #include "foundation/trusted_fs.h"
+#include "foundation/trusted_fs_internal.h"
 
 #include "zstd_store.h"
 
@@ -323,8 +324,8 @@ static bool artifact_directory_open(const char *repo_path, bool create,
             return false;
         }
     }
-    if (cbm_trusted_root_open(directory->path, &directory->root) != 0 ||
-        !artifact_directory_revalidate(directory)) {
+    int root_rc = cbm_trusted_root_open_mutable_children(directory->path, &directory->root);
+    if (root_rc != 0 || !artifact_directory_revalidate(directory)) {
         artifact_directory_close(directory);
         return false;
     }

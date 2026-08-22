@@ -2835,6 +2835,15 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         free(db_path);
         return CBM_NOT_FOUND;
     }
+    /* The byte writer deliberately omits store_meta. Seed the new file through
+     * the existing project choke point so every full rebuild gets a distinct
+     * cursor/provenance generation. */
+    if (cbm_store_upsert_project(hash_store, p->project_name, p->repo_path) != CBM_STORE_OK) {
+        cbm_log_error("pipeline.err", "phase", "persist_generation", "project", p->project_name);
+        cbm_store_close(hash_store);
+        free(db_path);
+        return CBM_NOT_FOUND;
+    }
     bool hash_records_complete = true;
     bool trust_persist_ok = true;
     {

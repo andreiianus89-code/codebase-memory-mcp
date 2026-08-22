@@ -693,7 +693,7 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                            cbm_file_info_t *files, int file_count,
+                            const char *root_path, cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                             const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template) {
@@ -715,6 +715,11 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (!hash_store) {
         cbm_log_error("incremental.err", "msg", "open_staging_after_dump", "path", db_path);
+        return CBM_STORE_ERR;
+    }
+    if (cbm_store_upsert_project(hash_store, project, root_path) != CBM_STORE_OK) {
+        cbm_log_error("incremental.err", "msg", "persist_generation", "project", project);
+        cbm_store_close(hash_store);
         return CBM_STORE_ERR;
     }
     int rc =
@@ -1091,8 +1096,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = 1,
     };
-    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                                      mode_skipped_count, cov, cov_n, &coverage_meta);
+    int persist_rc =
+        dump_and_persist(existing, db_path, project, cbm_pipeline_repo_path(p), files, file_count,
+                         mode_skipped, mode_skipped_count, cov, cov_n, &coverage_meta);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);

@@ -17,4 +17,9 @@ uint32_t cbm_trusted_root_final_open_flags_for_test(void);
 
 #endif
 
+/* Internal mutable-child anchor. Windows permits child creation/rename while
+ * the final directory remains protected from delete/rename; POSIX is the
+ * regular descriptor-anchored open. */
+int cbm_trusted_root_open_mutable_children(const char *root_path, cbm_trusted_root_t **out);
+
 #endif

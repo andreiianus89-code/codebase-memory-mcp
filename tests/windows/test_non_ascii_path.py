@@ -344,9 +344,10 @@ def trusted_full_guard(binary, work):
             initial_hashes.get("src/main.ts") == expected_main and
             refreshed_hashes.get("src/math.ts") == expected_refreshed_math and
             refreshed_hashes.get("src/main.ts") == expected_main,
-        "refresh replaces generation and graph content":
+        "refresh replaces generation":
             bool(initial_provenance.get("generation")) and
-            initial_provenance.get("generation") != refreshed_provenance.get("generation") and
+            initial_provenance.get("generation") != refreshed_provenance.get("generation"),
+        "refresh replaces graph content":
             refreshed_symbol.get("total", 0) > 0,
     }
     failed = [name for name, passed in checks.items() if not passed]

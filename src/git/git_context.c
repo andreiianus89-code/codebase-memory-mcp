@@ -139,8 +139,16 @@ typedef struct {
 static char *trusted_git_executable(void) {
 #ifdef _WIN32
     static const wchar_t *const candidates[] = {
-        L"C:\\Program Files\\Git\\cmd\\git.exe",
+#if defined(_M_ARM64) || defined(__aarch64__)
+        L"C:\\Program Files\\Git\\clangarm64\\bin\\git.exe",
+#elif defined(_M_X64) || defined(__x86_64__)
+        L"C:\\Program Files\\Git\\ucrt64\\bin\\git.exe",
+        L"C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+#elif defined(_M_IX86) || defined(__i386__)
+        L"C:\\Program Files (x86)\\Git\\mingw32\\bin\\git.exe",
+#endif
         L"C:\\Program Files\\Git\\bin\\git.exe",
+        L"C:\\Program Files\\Git\\cmd\\git.exe",
         L"C:\\Program Files (x86)\\Git\\cmd\\git.exe",
     };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {

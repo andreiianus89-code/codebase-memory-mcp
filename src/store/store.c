@@ -1703,14 +1703,17 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
      * point every index run (full, incremental, watcher) passes through.
      * Created here rather than in the byte-level writer: adding a table to
      * its hand-built sqlite_master is rootpage surgery for zero benefit. */
-    (void)sqlite3_exec(s->db,
-                       "CREATE TABLE IF NOT EXISTS store_meta (k TEXT PRIMARY KEY, v TEXT);"
-                       "INSERT OR IGNORE INTO store_meta VALUES"
-                       "('db_uid', lower(hex(randomblob(8))));"
-                       "INSERT OR IGNORE INTO store_meta VALUES('mutation_gen','0');"
-                       "UPDATE store_meta SET v = CAST(CAST(v AS INTEGER)+1 AS TEXT) "
-                       "WHERE k='mutation_gen';",
-                       NULL, NULL, NULL);
+    if (sqlite3_exec(s->db,
+                     "CREATE TABLE IF NOT EXISTS store_meta (k TEXT PRIMARY KEY, v TEXT);"
+                     "INSERT OR IGNORE INTO store_meta VALUES"
+                     "('db_uid', lower(hex(randomblob(8))));"
+                     "INSERT OR IGNORE INTO store_meta VALUES('mutation_gen','0');"
+                     "UPDATE store_meta SET v = CAST(CAST(v AS INTEGER)+1 AS TEXT) "
+                     "WHERE k='mutation_gen';",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "upsert_project generation");
+        return CBM_STORE_ERR;
+    }
     return CBM_STORE_OK;
 }
 

@@ -935,15 +935,35 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
  * replaces atomically; Windows rename fails with EEXIST when the target
  * exists, so use write-through MoveFileExW(MOVEFILE_REPLACE_EXISTING) there
  * (wide paths — raw MoveFileExA would re-mangle non-ASCII cache paths). */
+#ifdef _WIN32
+static unsigned int rename_replace_failures_for_test;
+#endif
+
 int cbm_rename_replace(const char *src, const char *dst) {
 #ifdef _WIN32
     wchar_t *wsrc = cbm_path_to_wide(src);
     wchar_t *wdst = cbm_path_to_wide(dst);
     int ret = CBM_NOT_FOUND;
     if (wsrc && wdst) {
-        ret = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
-                  ? 0
-                  : CBM_NOT_FOUND;
+        for (unsigned int attempt = 0; attempt < 10; attempt++) {
+            DWORD error;
+            if (rename_replace_failures_for_test > 0) {
+                rename_replace_failures_for_test--;
+                error = ERROR_SHARING_VIOLATION;
+            } else if (MoveFileExW(wsrc, wdst,
+                                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                ret = 0;
+                break;
+            } else {
+                error = GetLastError();
+            }
+            if ((error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION &&
+                 error != ERROR_ACCESS_DENIED) ||
+                attempt == 9) {
+                break;
+            }
+            Sleep(50);
+        }
     }
     free(wsrc);
     free(wdst);
@@ -952,6 +972,13 @@ int cbm_rename_replace(const char *src, const char *dst) {
     return rename(src, dst);
 #endif
 }
+
+#ifdef _WIN32
+void cbm_rename_replace_failures_set_for_test(unsigned int count) {
+    /* Same single-threaded test seam contract as cbm_popen_last_was_isolated. */
+    rename_replace_failures_for_test = count;
+}
+#endif
 
 /* Remove a SQLite database's -wal/-shm/-journal sidecars (both platforms). Any code
  * path that installs a FRESH database file at a path where a previous

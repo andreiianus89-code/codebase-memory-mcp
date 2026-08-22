@@ -100,11 +100,9 @@ static int make_git_repo_win(const char *dir) {
                : -1;
 }
 
-static bool canonical_paths_equal_win(char *actual, const char *path) {
-    char expected[4096];
-    return actual && cbm_canonical_path(path, expected, sizeof(expected)) &&
-           strcmp(cbm_normalize_path_sep(actual),
-                  cbm_normalize_path_sep(expected)) == 0;
+static bool git_paths_equal_win(char *left, char *right) {
+    return left && right &&
+           strcmp(cbm_normalize_path_sep(left), cbm_normalize_path_sep(right)) == 0;
 }
 
 static void native_path_win(const char *path, char *out, size_t out_size) {
@@ -158,7 +156,7 @@ TEST(canonical_root_repo_root) {
     cbm_git_context_t ctx = {0};
     ASSERT_EQ(cbm_git_context_resolve(root, &ctx), 0);
     ASSERT_TRUE(ctx.is_git);
-    ASSERT_TRUE(canonical_paths_equal_win(ctx.canonical_root, root));
+    ASSERT_TRUE(git_paths_equal_win(ctx.canonical_root, ctx.worktree_root));
     cbm_git_context_free(&ctx);
     th_rmtree(root);
     PASS();
@@ -216,7 +214,7 @@ TEST(canonical_root_subdir) {
     cbm_git_context_t ctx = {0};
     ASSERT_EQ(cbm_git_context_resolve(subdir, &ctx), 0);
     ASSERT_TRUE(ctx.is_git);
-    ASSERT_TRUE(canonical_paths_equal_win(ctx.canonical_root, root));
+    ASSERT_TRUE(git_paths_equal_win(ctx.canonical_root, ctx.worktree_root));
     cbm_git_context_free(&ctx);
     th_rmtree(root);
     PASS();
@@ -297,7 +295,10 @@ TEST(canonical_root_linked_worktree) {
     ASSERT_EQ(cbm_git_context_resolve(worktree, &ctx), 0);
     ASSERT_TRUE(ctx.is_git);
     ASSERT_TRUE(ctx.is_worktree);
-    ASSERT_TRUE(canonical_paths_equal_win(ctx.canonical_root, main_root));
+    cbm_git_context_t main_ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(main_root, &main_ctx), 0);
+    ASSERT_TRUE(git_paths_equal_win(ctx.canonical_root, main_ctx.canonical_root));
+    cbm_git_context_free(&main_ctx);
     cbm_git_context_free(&ctx);
     const char *remove_worktree[] = {"worktree", "remove", "--force", worktree, NULL};
     ASSERT_EQ(git_run_win(main_root, remove_worktree), 0);
@@ -465,7 +466,7 @@ TEST(trusted_context_batches_git_commands) {
     cbm_git_context_t context = {0};
     ASSERT_EQ(cbm_git_context_resolve_trusted(root_path, root, &context), 0);
     ASSERT_TRUE(context.is_git);
-    ASSERT_TRUE(canonical_paths_equal_win(context.canonical_root, root_path));
+    ASSERT_TRUE(git_paths_equal_win(context.canonical_root, context.worktree_root));
     ASSERT_EQ(cbm_git_trusted_command_count_for_tests(), 3);
 
     char **files = NULL;
@@ -795,6 +796,32 @@ TEST(trusted_root_windows_pins_relative_ancestors_through_final_open) {
     ASSERT_EQ(th_rmtree(base), 0);
     PASS();
 }
+
+TEST(trusted_root_windows_mutable_children_preserves_root_identity) {
+    char root[512];
+    char moved[512];
+    char temp[768];
+    char final[768];
+    char *tmp = th_mktempdir("cbm_trusted_mutable_win");
+    ASSERT_NOT_NULL(tmp);
+    snprintf(root, sizeof(root), "%s/root", tmp);
+    snprintf(moved, sizeof(moved), "%s/moved", tmp);
+    snprintf(temp, sizeof(temp), "%s/temp", root);
+    snprintf(final, sizeof(final), "%s/final", root);
+    ASSERT_EQ(th_mkdir_p(root), 0);
+    ASSERT_EQ(th_write_file(temp, "payload"), 0);
+
+    cbm_trusted_root_t *anchor = NULL;
+    ASSERT_EQ(cbm_trusted_root_open_mutable_children(root, &anchor), 0);
+    ASSERT_NOT_NULL(anchor);
+    ASSERT_EQ(cbm_rename_replace(temp, final), 0);
+    ASSERT_NEQ(cbm_rename_replace(root, moved), 0);
+    ASSERT_TRUE(cbm_trusted_root_matches_path(anchor, root));
+    cbm_trusted_root_close(anchor);
+    ASSERT_EQ(cbm_rename_replace(root, moved), 0);
+    th_rmtree(tmp);
+    PASS();
+}
 #endif
 
 #ifndef _WIN32
@@ -840,6 +867,7 @@ SUITE(git_context) {
     RUN_TEST(trusted_root_windows_unicode_deep_read_and_replacement_pin);
     RUN_TEST(trusted_root_windows_rejects_intermediate_and_final_reparse_points);
     RUN_TEST(trusted_root_windows_pins_relative_ancestors_through_final_open);
+    RUN_TEST(trusted_root_windows_mutable_children_preserves_root_identity);
 #endif
 #ifndef _WIN32
     RUN_TEST(trusted_source_read_rejects_fifo_without_blocking);

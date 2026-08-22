@@ -204,7 +204,8 @@ static time_t trusted_win_filetime_seconds(FILETIME value) {
     return (time_t)((ticks - unix_epoch_ticks) / UINT64_C(10000000));
 }
 
-int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
+static int trusted_win_root_open(const char *root_path, DWORD final_share,
+                                 cbm_trusted_root_t **out) {
     if (!root_path || !out) {
         return CBM_NOT_FOUND;
     }
@@ -220,7 +221,7 @@ int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
         return CBM_NOT_FOUND;
     }
     HANDLE handle =
-        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL,
+        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, final_share, NULL,
                     OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (handle == INVALID_HANDLE_VALUE) {
         trusted_win_close_ancestors(ancestor_handles, ancestor_count);
@@ -257,6 +258,14 @@ int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
     root->ancestor_count = ancestor_count;
     *out = root;
     return 0;
+}
+
+int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
+    return trusted_win_root_open(root_path, FILE_SHARE_READ, out);
+}
+
+int cbm_trusted_root_open_mutable_children(const char *root_path, cbm_trusted_root_t **out) {
+    return trusted_win_root_open(root_path, FILE_SHARE_READ | FILE_SHARE_WRITE, out);
 }
 
 void cbm_trusted_root_close(cbm_trusted_root_t *root) {
@@ -453,6 +462,10 @@ int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
     root->inode = status.st_ino;
     *out = root;
     return 0;
+}
+
+int cbm_trusted_root_open_mutable_children(const char *root_path, cbm_trusted_root_t **out) {
+    return cbm_trusted_root_open(root_path, out);
 }
 
 void cbm_trusted_root_close(cbm_trusted_root_t *root) {

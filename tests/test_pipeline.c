@@ -5821,6 +5821,14 @@ TEST(incremental_detects_changed_file) {
     char *project = strdup(cbm_pipeline_project_name(p));
     cbm_pipeline_free(p);
 
+    char generation_before[96];
+    cbm_store_t *s = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_generation(s, generation_before, sizeof(generation_before)),
+              CBM_STORE_OK);
+    ASSERT_STR_NEQ(generation_before, "legacy");
+    cbm_store_close(s);
+
     /* Modify helper.go — add a new function */
     char path[512];
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
@@ -5837,10 +5845,14 @@ TEST(incremental_detects_changed_file) {
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     /* Verify node count increased (NewFunc was added) */
-    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    s = cbm_store_open_path_query(g_incr_dbpath);
     ASSERT_NOT_NULL(s);
     int nodes_after = cbm_store_count_nodes(s, project);
     ASSERT_GT(nodes_after, 0);
+    char generation_after[96];
+    ASSERT_EQ(cbm_store_generation(s, generation_after, sizeof(generation_after)), CBM_STORE_OK);
+    ASSERT_STR_NEQ(generation_after, "legacy");
+    ASSERT_STR_NEQ(generation_before, generation_after);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);

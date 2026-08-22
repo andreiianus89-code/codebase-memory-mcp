@@ -173,7 +173,7 @@ static int cmp_scope_by_specificity(const void *a, const void *b) {
  * missing, malformed, or has neither a usable paths block nor a baseUrl. */
 static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char *dir_prefix,
                                                 cbm_pipeline_t *pipeline) {
-    FILE *f = cbm_fopen(abs_path, "r");
+    FILE *f = cbm_fopen(abs_path, "rb");
     if (!f) {
         return NULL;
     }

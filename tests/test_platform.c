@@ -4,6 +4,7 @@
 #include "test_framework.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/compat_fs_internal.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/platform.h"
@@ -101,6 +102,42 @@ TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
     ASSERT_NOT_NULL(strstr(file_template, "Ã©Ã¨"));
     PASS();
 }
+
+#ifdef _WIN32
+TEST(platform_rename_replace_retries_transient_windows_failure) {
+    char directory[CBM_SZ_256];
+    char source[CBM_SZ_512];
+    char destination[CBM_SZ_512];
+    snprintf(directory, sizeof(directory), "/tmp/cbm-rename-retry-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(directory));
+    snprintf(source, sizeof(source), "%s/source", directory);
+    snprintf(destination, sizeof(destination), "%s/destination", directory);
+
+    FILE *file = cbm_fopen(source, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_GTE(fputs("new", file), 0);
+    ASSERT_EQ(fclose(file), 0);
+    file = cbm_fopen(destination, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_GTE(fputs("old", file), 0);
+    ASSERT_EQ(fclose(file), 0);
+
+    cbm_rename_replace_failures_set_for_test(1);
+    int rename_rc = cbm_rename_replace(source, destination);
+    cbm_rename_replace_failures_set_for_test(0);
+    ASSERT_EQ(rename_rc, 0);
+
+    file = cbm_fopen(destination, "rb");
+    ASSERT_NOT_NULL(file);
+    char contents[4] = {0};
+    ASSERT_EQ(fread(contents, 1, 3, file), 3);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_STR_EQ(contents, "new");
+    ASSERT_EQ(cbm_unlink(destination), 0);
+    ASSERT_EQ(cbm_rmdir(directory), 0);
+    PASS();
+}
+#endif
 
 TEST(platform_counter_scaling_avoids_intermediate_overflow) {
     const uint64_t frequency = UINT64_C(10000000);
@@ -627,6 +664,7 @@ SUITE(platform) {
     RUN_TEST(platform_path_helpers_use_per_thread_storage);
     RUN_TEST(platform_cache_dir_rejects_truncated_override);
 #ifdef _WIN32
+    RUN_TEST(platform_rename_replace_retries_transient_windows_failure);
     RUN_TEST(platform_setenv_preserves_utf8_in_wide_environment);
     RUN_TEST(platform_windows_empty_environment_is_read_and_unset_idempotently);
 #endif

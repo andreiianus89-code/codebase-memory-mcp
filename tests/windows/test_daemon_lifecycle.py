@@ -46,7 +46,10 @@ def windows_private_directory_oracle(path):
         return True, ""
     script = r"""
 $ErrorActionPreference = 'Stop'
-$acl = Get-Acl -LiteralPath $env:CBM_DACL_ORACLE_PATH
+$sections = ([System.Security.AccessControl.AccessControlSections]::Owner -bor
+    [System.Security.AccessControl.AccessControlSections]::Access)
+$acl = [System.IO.Directory]::GetAccessControl(
+    $env:CBM_DACL_ORACLE_PATH, $sections)
 $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new(
     $acl.GetSecurityDescriptorBinaryForm(), 0)
 $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
