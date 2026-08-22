@@ -4138,11 +4138,11 @@ static bool win_runtime_directory_validate(const wchar_t *runtime_dir) {
         return false;
     }
     BY_HANDLE_FILE_INFORMATION info;
-    bool valid = GetFileInformationByHandle(directory, &info) != 0 &&
-                 (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
-                 (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                 win_file_security_secure(&security, directory, true,
-                                          win_private_mutation_rights());
+    bool valid =
+        GetFileInformationByHandle(directory, &info) != 0 &&
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+        win_file_security_secure(&security, directory, true, win_private_mutation_rights());
     (void)CloseHandle(directory);
     win_security_destroy(&security);
     return valid;

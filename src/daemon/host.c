@@ -593,8 +593,7 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
         cbm_daemon_application_set_permanent(host->application, true);
     }
     if (!host->application ||
-        (!host->read_only &&
-         (!host->watch_store || !host->watcher || !host->project_locks))) {
+        (!host->read_only && (!host->watch_store || !host->watcher || !host->project_locks))) {
         return false;
     }
     return true;

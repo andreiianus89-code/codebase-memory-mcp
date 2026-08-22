@@ -85,17 +85,17 @@ static bool win_mkdtemp_private_handle_valid(HANDLE directory, PSID expected_use
                               OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, NULL,
                               &dacl, NULL, &descriptor)
             : ERROR_INVALID_HANDLE;
-    bool valid = directory != INVALID_HANDLE_VALUE && GetFileType(directory) == FILE_TYPE_DISK &&
-                 GetFileInformationByHandle(directory, &information) != 0 &&
-                 (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
-                 (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-                 security_result == ERROR_SUCCESS && descriptor && owner && dacl &&
-                 IsValidSid(owner) && IsValidSid(expected_user) && EqualSid(owner, expected_user) &&
-                 GetSecurityDescriptorControl(descriptor, &control, &revision) &&
-                 (control & SE_DACL_PRESENT) != 0 && (control & SE_DACL_PROTECTED) != 0 &&
-                 GetAclInformation(dacl, &acl_information, sizeof(acl_information),
-                                   AclSizeInformation) &&
-                 acl_information.AceCount == 1 && GetAce(dacl, 0, &opaque_ace) && opaque_ace;
+    bool valid =
+        directory != INVALID_HANDLE_VALUE && GetFileType(directory) == FILE_TYPE_DISK &&
+        GetFileInformationByHandle(directory, &information) != 0 &&
+        (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+        (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+        security_result == ERROR_SUCCESS && descriptor && owner && dacl && IsValidSid(owner) &&
+        IsValidSid(expected_user) && EqualSid(owner, expected_user) &&
+        GetSecurityDescriptorControl(descriptor, &control, &revision) &&
+        (control & SE_DACL_PRESENT) != 0 && (control & SE_DACL_PROTECTED) != 0 &&
+        GetAclInformation(dacl, &acl_information, sizeof(acl_information), AclSizeInformation) &&
+        acl_information.AceCount == 1 && GetAce(dacl, 0, &opaque_ace) && opaque_ace;
     if (valid) {
         ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)opaque_ace;
         PSID ace_sid = (PSID)&ace->SidStart;
@@ -147,8 +147,7 @@ static bool win_mkdtemp_private_create(const char *path) {
                     wide, READ_CONTROL | FILE_READ_ATTRIBUTES,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-                bool private_object =
-                    win_mkdtemp_private_handle_valid(directory, user->User.Sid);
+                bool private_object = win_mkdtemp_private_handle_valid(directory, user->User.Sid);
                 if (directory != INVALID_HANDLE_VALUE) {
                     (void)CloseHandle(directory);
                 }
@@ -178,11 +177,7 @@ char *cbm_mkdtemp(char *tmpl) {
     char buf[CBM_SZ_256];
     int written;
     if (strncmp(tmpl, "/tmp/", 5) == 0) {
-        const char *tmp = getenv("TEMP");
-        if (!tmp)
-            tmp = getenv("TMP");
-        if (!tmp)
-            tmp = ".";
+        const char *tmp = cbm_tmpdir();
         written = snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
     } else {
         written = snprintf(buf, sizeof(buf), "%s", tmpl);
@@ -266,11 +261,7 @@ int cbm_mkstemp(char *tmpl) {
     char buf[CBM_SZ_4K];
     int written;
     if (strncmp(tmpl, "/tmp/", 5) == 0) {
-        const char *tmp = getenv("TEMP");
-        if (!tmp)
-            tmp = getenv("TMP");
-        if (!tmp)
-            tmp = ".";
+        const char *tmp = cbm_tmpdir();
         written = snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
     } else {
         written = snprintf(buf, sizeof(buf), "%s", tmpl);

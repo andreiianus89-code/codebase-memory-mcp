@@ -894,8 +894,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                                  itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                                  itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
                 }
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM ||
-                       rst == CBM_READ_SHORT) {
+            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM || rst == CBM_READ_SHORT) {
                 pp_err_add(errs, fi->rel_path, "read failed", "read");
             }
             /* CBM_READ_EMPTY: benign 0-byte file — not reported. */
@@ -1099,8 +1098,7 @@ static void log_extract_mem_stats(int worker_count) {
 
 /* Forward declaration: macro table builder lives in pipeline.c (shared path). */
 CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
-                                                const char *repo_path,
-                                                cbm_pipeline_t *pipeline);
+                                                const char *repo_path, cbm_pipeline_t *pipeline);
 
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
@@ -2858,8 +2856,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             if ((!lsp_source || lsp_source_len <= 0) && rc->files[file_idx].path) {
                 /* Retention cap skipped this file — re-read on demand (bounded
                  * by read_file's cbm_max_file_bytes cap), freed below. */
-                lsp_source_owned = read_file(rc->pipeline, rc->files[file_idx].path,
-                                             &lsp_source_len, NULL, NULL);
+                lsp_source_owned =
+                    read_file(rc->pipeline, rc->files[file_idx].path, &lsp_source_len, NULL, NULL);
                 lsp_source = lsp_source_owned;
             }
             if (lsp_source && lsp_source_len > 0) {

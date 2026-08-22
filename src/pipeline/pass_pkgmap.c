@@ -1013,9 +1013,10 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
                                               excluded_dirs, excluded_count, NULL);
 }
 
-CBMHashTable *cbm_pkgmap_build_from_repo_trusted(
-    const char *repo_path, const cbm_file_info_t *files, int file_count, const char *project_name,
-    char **excluded_dirs, int excluded_count, cbm_pipeline_t *pipeline) {
+CBMHashTable *cbm_pkgmap_build_from_repo_trusted(const char *repo_path,
+                                                 const cbm_file_info_t *files, int file_count,
+                                                 const char *project_name, char **excluded_dirs,
+                                                 int excluded_count, cbm_pipeline_t *pipeline) {
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
 

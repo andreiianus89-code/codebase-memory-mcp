@@ -38,7 +38,7 @@ static bool trusted_rel_path_valid(const char *path) {
         return false;
     }
 #ifdef _WIN32
-    if (path[0] == '\\' || (path[0] && path[1] == ':')) {
+    if (path[0] == '\\' || path[1] == ':') {
         return false;
     }
 #endif
@@ -79,8 +79,7 @@ static wchar_t *trusted_win_final_path(HANDLE handle) {
     if (!path) {
         return NULL;
     }
-    DWORD written =
-        GetFinalPathNameByHandleW(handle, path, needed + 1, FILE_NAME_NORMALIZED);
+    DWORD written = GetFinalPathNameByHandleW(handle, path, needed + 1, FILE_NAME_NORMALIZED);
     if (written == 0 || written > needed) {
         free(path);
         return NULL;
@@ -98,8 +97,7 @@ static bool trusted_win_path_below(const wchar_t *root, const wchar_t *candidate
     size_t root_len = wcslen(root);
     size_t candidate_len = wcslen(candidate);
     if (root_len >= candidate_len || root_len > INT_MAX ||
-        CompareStringOrdinal(candidate, (int)root_len, root, (int)root_len, FALSE) !=
-            CSTR_EQUAL) {
+        CompareStringOrdinal(candidate, (int)root_len, root, (int)root_len, FALSE) != CSTR_EQUAL) {
         return false;
     }
     return candidate[root_len] == L'\\' || candidate[root_len] == L'/';
@@ -112,8 +110,7 @@ static bool trusted_win_same_identity(const BY_HANDLE_FILE_INFORMATION *left,
            left->nFileIndexLow == right->nFileIndexLow;
 }
 
-static CBM_TLS cbm_trusted_root_before_final_open_hook_fn
-    trusted_win_before_final_open_hook;
+static CBM_TLS cbm_trusted_root_before_final_open_hook_fn trusted_win_before_final_open_hook;
 static CBM_TLS void *trusted_win_before_final_open_context;
 
 void cbm_trusted_root_set_before_final_open_hook_for_test(
@@ -139,8 +136,7 @@ static void trusted_win_close_ancestors(HANDLE *handles, size_t count) {
     free(handles);
 }
 
-static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles,
-                                      size_t *out_count) {
+static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles, size_t *out_count) {
     if (!path || !out_handles || !out_count) {
         return false;
     }
@@ -153,8 +149,7 @@ static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles,
     }
     size_t length = wcslen(path);
     size_t start = 0;
-    if (length >= 7 && wcsncmp(path, L"\\\\?\\", 4) == 0 &&
-        path[5] == L':' && path[6] == L'\\') {
+    if (length >= 7 && wcsncmp(path, L"\\\\?\\", 4) == 0 && path[5] == L':' && path[6] == L'\\') {
         start = 7;
     } else if (length >= 3 && path[1] == L':' && path[2] == L'\\') {
         start = 3;
@@ -169,18 +164,14 @@ static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles,
         }
         wchar_t saved = path[i];
         path[i] = L'\0';
-        HANDLE handle =
-            CreateFileW(path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
-                        FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                        FILE_FLAG_BACKUP_SEMANTICS |
-                            FILE_FLAG_OPEN_REPARSE_POINT,
-                        NULL);
+        HANDLE handle = CreateFileW(
+            path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         path[i] = saved;
         FILE_ATTRIBUTE_TAG_INFO tag = {0};
         bool valid =
             handle != INVALID_HANDLE_VALUE &&
-            GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag,
-                                         sizeof(tag)) &&
+            GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) &&
             (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
             !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
         if (!valid) {
@@ -190,8 +181,7 @@ static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles,
             trusted_win_close_ancestors(handles, count);
             return false;
         }
-        HANDLE *grown =
-            (HANDLE *)realloc(handles, (count + 1) * sizeof(*grown));
+        HANDLE *grown = (HANDLE *)realloc(handles, (count + 1) * sizeof(*grown));
         if (!grown) {
             CloseHandle(handle);
             trusted_win_close_ancestors(handles, count);
@@ -206,15 +196,12 @@ static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles,
 }
 
 static time_t trusted_win_filetime_seconds(FILETIME value) {
-    ULARGE_INTEGER ticks;
-    ticks.LowPart = value.dwLowDateTime;
-    ticks.HighPart = value.dwHighDateTime;
+    uint64_t ticks = ((uint64_t)value.dwHighDateTime << 32) | (uint64_t)value.dwLowDateTime;
     static const uint64_t unix_epoch_ticks = UINT64_C(116444736000000000);
-    if (ticks.QuadPart <= unix_epoch_ticks) {
+    if (ticks <= unix_epoch_ticks) {
         return (time_t)0;
     }
-    return (time_t)((ticks.QuadPart - unix_epoch_ticks) /
-                    UINT64_C(10000000));
+    return (time_t)((ticks - unix_epoch_ticks) / UINT64_C(10000000));
 }
 
 int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
@@ -228,15 +215,13 @@ int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
     }
     HANDLE *ancestor_handles = NULL;
     size_t ancestor_count = 0;
-    if (!trusted_win_pin_ancestors(wide, &ancestor_handles,
-                                   &ancestor_count)) {
+    if (!trusted_win_pin_ancestors(wide, &ancestor_handles, &ancestor_count)) {
         free(wide);
         return CBM_NOT_FOUND;
     }
     HANDLE handle =
-        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
-                    FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (handle == INVALID_HANDLE_VALUE) {
         trusted_win_close_ancestors(ancestor_handles, ancestor_count);
         free(wide);
@@ -245,11 +230,10 @@ int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
     FILE_ATTRIBUTE_TAG_INFO tag = {0};
     BY_HANDLE_FILE_INFORMATION identity = {0};
     wchar_t *final_path = trusted_win_final_path(handle);
-    bool valid =
-        GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) &&
-        !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-        (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-        GetFileInformationByHandle(handle, &identity) && final_path;
+    bool valid = GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+                 !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                 (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                 GetFileInformationByHandle(handle, &identity) && final_path;
     if (!valid) {
         free(final_path);
         CloseHandle(handle);
@@ -282,8 +266,7 @@ void cbm_trusted_root_close(cbm_trusted_root_t *root) {
     if (root->handle && root->handle != INVALID_HANDLE_VALUE) {
         CloseHandle(root->handle);
     }
-    trusted_win_close_ancestors(root->ancestor_handles,
-                                root->ancestor_count);
+    trusted_win_close_ancestors(root->ancestor_handles, root->ancestor_count);
     free(root->lexical_path);
     free(root->final_path);
     free(root);
@@ -298,20 +281,18 @@ bool cbm_trusted_root_matches_path(const cbm_trusted_root_t *root, const char *p
         return false;
     }
     HANDLE handle =
-        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
-                    FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     free(wide);
     if (handle == INVALID_HANDLE_VALUE) {
         return false;
     }
     FILE_ATTRIBUTE_TAG_INFO tag = {0};
     BY_HANDLE_FILE_INFORMATION identity = {0};
-    bool matches =
-        GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) &&
-        !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
-        GetFileInformationByHandle(handle, &identity) &&
-        trusted_win_same_identity(&root->identity, &identity);
+    bool matches = GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+                   !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                   GetFileInformationByHandle(handle, &identity) &&
+                   trusted_win_same_identity(&root->identity, &identity);
     CloseHandle(handle);
     return matches;
 }
@@ -342,8 +323,7 @@ int cbm_trusted_root_read_file(const cbm_trusted_root_t *root, const char *rel_p
         free(wide_rel);
         return CBM_NOT_FOUND;
     }
-    wchar_t *full =
-        (wchar_t *)malloc((root_len + rel_len + 2) * sizeof(*full));
+    wchar_t *full = (wchar_t *)malloc((root_len + rel_len + 2) * sizeof(*full));
     if (!full) {
         free(wide_rel);
         return CBM_NOT_FOUND;
@@ -360,35 +340,28 @@ int cbm_trusted_root_read_file(const cbm_trusted_root_t *root, const char *rel_p
      * final CreateFileW resolves it. */
     HANDLE *read_ancestor_handles = NULL;
     size_t read_ancestor_count = 0;
-    if (!trusted_win_pin_ancestors(full, &read_ancestor_handles,
-                                   &read_ancestor_count)) {
+    if (!trusted_win_pin_ancestors(full, &read_ancestor_handles, &read_ancestor_count)) {
         free(full);
         return CBM_NOT_FOUND;
     }
 
     if (trusted_win_before_final_open_hook) {
-        trusted_win_before_final_open_hook(
-            trusted_win_before_final_open_context);
+        trusted_win_before_final_open_hook(trusted_win_before_final_open_context);
     }
 
-    HANDLE file =
-        CreateFileW(full, GENERIC_READ | FILE_READ_ATTRIBUTES,
-                    FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                    trusted_win_final_open_flags(), NULL);
+    HANDLE file = CreateFileW(full, GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, trusted_win_final_open_flags(), NULL);
     free(full);
     if (file == INVALID_HANDLE_VALUE) {
-        trusted_win_close_ancestors(read_ancestor_handles,
-                                    read_ancestor_count);
+        trusted_win_close_ancestors(read_ancestor_handles, read_ancestor_count);
         return CBM_NOT_FOUND;
     }
     FILE_ATTRIBUTE_TAG_INFO final_tag = {0};
     wchar_t *final_path = trusted_win_final_path(file);
     BY_HANDLE_FILE_INFORMATION before = {0};
     bool admitted =
-        GetFileInformationByHandleEx(file, FileAttributeTagInfo, &final_tag,
-                                     sizeof(final_tag)) &&
-        !(final_tag.FileAttributes &
-          (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) &&
+        GetFileInformationByHandleEx(file, FileAttributeTagInfo, &final_tag, sizeof(final_tag)) &&
+        !(final_tag.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) &&
         final_path && trusted_win_path_below(root->final_path, final_path) &&
         GetFileInformationByHandle(file, &before) &&
         !(before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
@@ -397,23 +370,20 @@ int cbm_trusted_root_read_file(const cbm_trusted_root_t *root, const char *rel_p
     size_t limit = max_bytes ? max_bytes : SIZE_MAX;
     if (!admitted || file_size > limit || file_size > SIZE_MAX - 1) {
         CloseHandle(file);
-        trusted_win_close_ancestors(read_ancestor_handles,
-                                    read_ancestor_count);
+        trusted_win_close_ancestors(read_ancestor_handles, read_ancestor_count);
         return CBM_NOT_FOUND;
     }
     unsigned char *data = (unsigned char *)malloc((size_t)file_size + 1);
     if (!data) {
         CloseHandle(file);
-        trusted_win_close_ancestors(read_ancestor_handles,
-                                    read_ancestor_count);
+        trusted_win_close_ancestors(read_ancestor_handles, read_ancestor_count);
         return CBM_NOT_FOUND;
     }
     size_t used = 0;
     bool read_ok = true;
     while (used < (size_t)file_size) {
-        DWORD chunk = (DWORD)(((size_t)file_size - used) > UINT32_MAX
-                                  ? UINT32_MAX
-                                  : ((size_t)file_size - used));
+        DWORD chunk = (DWORD)(((size_t)file_size - used) > UINT32_MAX ? UINT32_MAX
+                                                                      : ((size_t)file_size - used));
         DWORD got = 0;
         if (!ReadFile(file, data + used, chunk, &got, NULL) || got == 0) {
             read_ok = false;
@@ -429,8 +399,7 @@ int cbm_trusted_root_read_file(const cbm_trusted_root_t *root, const char *rel_p
               before.ftLastWriteTime.dwHighDateTime == after.ftLastWriteTime.dwHighDateTime &&
               before.ftLastWriteTime.dwLowDateTime == after.ftLastWriteTime.dwLowDateTime;
     CloseHandle(file);
-    trusted_win_close_ancestors(read_ancestor_handles,
-                                read_ancestor_count);
+    trusted_win_close_ancestors(read_ancestor_handles, read_ancestor_count);
     if (!read_ok || used != (size_t)file_size) {
         free(data);
         return CBM_NOT_FOUND;
@@ -440,8 +409,7 @@ int cbm_trusted_root_read_file(const cbm_trusted_root_t *root, const char *rel_p
         memset(out_status, 0, sizeof(*out_status));
         out_status->st_mode = S_IFREG;
         out_status->st_size = (off_t)used;
-        out_status->st_mtime =
-            trusted_win_filetime_seconds(after.ftLastWriteTime);
+        out_status->st_mtime = trusted_win_filetime_seconds(after.ftLastWriteTime);
     }
     *out_data = data;
     *out_len = used;
@@ -580,21 +548,17 @@ static int trusted_open_regular_at(const cbm_trusted_root_t *root, const char *r
 
 static int64_t trusted_stat_change_ns(const struct stat *status) {
 #ifdef __APPLE__
-    return (int64_t)status->st_ctimespec.tv_sec * 1000000000LL +
-           status->st_ctimespec.tv_nsec;
+    return (int64_t)status->st_ctimespec.tv_sec * 1000000000LL + status->st_ctimespec.tv_nsec;
 #else
-    return (int64_t)status->st_ctim.tv_sec * 1000000000LL +
-           status->st_ctim.tv_nsec;
+    return (int64_t)status->st_ctim.tv_sec * 1000000000LL + status->st_ctim.tv_nsec;
 #endif
 }
 
 static int64_t trusted_stat_modify_ns(const struct stat *status) {
 #ifdef __APPLE__
-    return (int64_t)status->st_mtimespec.tv_sec * 1000000000LL +
-           status->st_mtimespec.tv_nsec;
+    return (int64_t)status->st_mtimespec.tv_sec * 1000000000LL + status->st_mtimespec.tv_nsec;
 #else
-    return (int64_t)status->st_mtim.tv_sec * 1000000000LL +
-           status->st_mtim.tv_nsec;
+    return (int64_t)status->st_mtim.tv_sec * 1000000000LL + status->st_mtim.tv_nsec;
 #endif
 }
 
@@ -646,12 +610,10 @@ int cbm_trusted_root_read_file(const cbm_trusted_root_t *root, const char *rel_p
         extra_read = read(fd, &extra, 1);
     } while (extra_read < 0 && errno == EINTR);
     struct stat after;
-    bool stable =
-        extra_read == 0 && fstat(fd, &after) == 0 &&
-        before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
-        before.st_size == after.st_size &&
-        trusted_stat_modify_ns(&before) == trusted_stat_modify_ns(&after) &&
-        trusted_stat_change_ns(&before) == trusted_stat_change_ns(&after);
+    bool stable = extra_read == 0 && fstat(fd, &after) == 0 && before.st_dev == after.st_dev &&
+                  before.st_ino == after.st_ino && before.st_size == after.st_size &&
+                  trusted_stat_modify_ns(&before) == trusted_stat_modify_ns(&after) &&
+                  trusted_stat_change_ns(&before) == trusted_stat_change_ns(&after);
     close(fd);
     if (!stable) {
         free(data);

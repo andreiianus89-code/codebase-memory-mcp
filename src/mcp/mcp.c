@@ -709,12 +709,9 @@ static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
 }
 
 static bool mcp_tool_blocked_read_only(const char *name) {
-    return name && (strcmp(name, "index_repository") == 0 ||
-                    strcmp(name, "delete_project") == 0 ||
-                    strcmp(name, "manage_adr") == 0 ||
-                    strcmp(name, "ingest_traces") == 0 ||
-                    strcmp(name, "search_code") == 0 ||
-                    strcmp(name, "detect_changes") == 0);
+    return name && (strcmp(name, "index_repository") == 0 || strcmp(name, "delete_project") == 0 ||
+                    strcmp(name, "manage_adr") == 0 || strcmp(name, "ingest_traces") == 0 ||
+                    strcmp(name, "search_code") == 0 || strcmp(name, "detect_changes") == 0);
 }
 
 static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
@@ -740,10 +737,9 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i, 
 
     const tool_annotation_def_t *def = mcp_tool_annotations(TOOLS[i].name);
     yyjson_mut_val *annotations = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_bool(doc, annotations, "readOnlyHint",
-                           read_only || (def && def->read_only));
+    yyjson_mut_obj_add_bool(doc, annotations, "readOnlyHint", read_only || (def && def->read_only));
     yyjson_mut_obj_add_bool(doc, annotations, "destructiveHint",
-                           read_only ? false : (def ? def->destructive : true));
+                            read_only ? false : (def ? def->destructive : true));
     yyjson_mut_obj_add_bool(doc, annotations, "idempotentHint", def ? def->idempotent : false);
     yyjson_mut_obj_add_bool(doc, annotations, "openWorldHint", def ? def->open_world : true);
     yyjson_mut_obj_add_val(doc, tool, "annotations", annotations);
@@ -1204,8 +1200,7 @@ static const char MCP_STRICT_SERVER_INSTRUCTIONS[] =
     "claims; coverage is best-effort, never proof of completeness. Paginate when indicated.";
 
 static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
-                                                     cbm_mcp_tool_profile_t profile,
-                                                     bool read_only,
+                                                     cbm_mcp_tool_profile_t profile, bool read_only,
                                                      bool git_tracked_only) {
     /* Determine protocol version: if client requests a version we support,
      * echo it back; otherwise respond with our latest. */
@@ -1246,10 +1241,10 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
     yyjson_mut_obj_add_bool(doc, prompts_cap, "listChanged", false);
     yyjson_mut_obj_add_val(doc, caps, "prompts", prompts_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
-    const char *instructions =
-        read_only ? (git_tracked_only ? MCP_STRICT_TRACKED_SERVER_INSTRUCTIONS
-                                      : MCP_STRICT_SERVER_INSTRUCTIONS)
-                  : MCP_SERVER_INSTRUCTIONS;
+    const char *instructions = read_only
+                                   ? (git_tracked_only ? MCP_STRICT_TRACKED_SERVER_INSTRUCTIONS
+                                                       : MCP_STRICT_SERVER_INSTRUCTIONS)
+                                   : MCP_SERVER_INSTRUCTIONS;
     if (!read_only && profile == CBM_MCP_TOOL_PROFILE_ANALYSIS) {
         instructions = MCP_ANALYSIS_SERVER_INSTRUCTIONS;
     } else if (!read_only && profile == CBM_MCP_TOOL_PROFILE_SCOUT) {
@@ -1263,8 +1258,8 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
 }
 
 char *cbm_mcp_initialize_response(const char *params_json) {
-    return cbm_mcp_initialize_response_for_profile(
-        params_json, CBM_MCP_TOOL_PROFILE_ALL, false, false);
+    return cbm_mcp_initialize_response_for_profile(params_json, CBM_MCP_TOOL_PROFILE_ALL, false,
+                                                   false);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1571,9 +1566,8 @@ static bool mcp_store_project_allowed(cbm_mcp_server_t *srv, cbm_store_t *store,
         return true;
     }
     cbm_project_t project = {0};
-    bool found =
-        store && project_name &&
-        cbm_store_get_project(store, project_name, &project) == CBM_STORE_OK;
+    bool found = store && project_name &&
+                 cbm_store_get_project(store, project_name, &project) == CBM_STORE_OK;
     bool allowed = found && mcp_project_root_allowed(srv, project.root_path);
     cbm_project_free_fields(&project);
     return allowed;
@@ -1869,9 +1863,9 @@ void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command
     srv->command_test_context = context;
 }
 
-void cbm_mcp_server_set_trusted_source_read_test_hook(
-    cbm_mcp_server_t *srv, cbm_mcp_trusted_source_read_test_hook_fn hook,
-    void *context) {
+void cbm_mcp_server_set_trusted_source_read_test_hook(cbm_mcp_server_t *srv,
+                                                      cbm_mcp_trusted_source_read_test_hook_fn hook,
+                                                      void *context) {
     if (!srv) {
         return;
     }
@@ -2124,16 +2118,16 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
      * prevent ghost .db file creation for unknown/unindexed projects. */
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
-    srv->store = srv->read_only ? cbm_store_open_path_query_strict(path)
-                                : cbm_store_open_path_query(path);
+    srv->store =
+        srv->read_only ? cbm_store_open_path_query_strict(path) : cbm_store_open_path_query(path);
     if (srv->store) {
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {
             cbm_store_close(srv->store);
             srv->store = NULL;
             if (srv->read_only) {
-                cbm_log_error("store.read_only_reject", "project", project, "path", path,
-                              "reason", "integrity_check_failed");
+                cbm_log_error("store.read_only_reject", "project", project, "path", path, "reason",
+                              "integrity_check_failed");
                 return NULL;
             }
             bool mutation_acquired = mutation_already_held;
@@ -2173,8 +2167,7 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
          * store without closing it leaks the SQLite connection. */
         cbm_project_t proj_verify = {0};
         if (cbm_store_get_project(srv->store, project, &proj_verify) == CBM_STORE_OK) {
-            bool allowed =
-                !srv->read_only || mcp_project_root_allowed(srv, proj_verify.root_path);
+            bool allowed = !srv->read_only || mcp_project_root_allowed(srv, proj_verify.root_path);
             cbm_project_free_fields(&proj_verify);
             if (!allowed) {
                 cbm_store_close(srv->store);
@@ -2230,8 +2223,7 @@ static void free_node_contents(cbm_node_t *n);
 
 /* Scan cache dir for .db files, writing comma-separated quoted names into out.
  * Returns the number of projects found. */
-static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz,
-                                    bool strict) {
+static int collect_db_project_names(const char *dir_path, char *out, size_t out_sz, bool strict) {
     int count = 0;
     int offset = 0;
     cbm_dir_t *d = cbm_opendir(dir_path);
@@ -2256,8 +2248,7 @@ static int collect_db_project_names(const char *dir_path, char *out, size_t out_
         }
         if (strict) {
             size_t internal_len = strlen(iname);
-            if (len != internal_len + MCP_DB_EXT ||
-                memcmp(n, iname, internal_len) != 0) {
+            if (len != internal_len + MCP_DB_EXT || memcmp(n, iname, internal_len) != 0) {
                 continue;
             }
         }
@@ -2331,8 +2322,7 @@ static char *build_project_list_error(cbm_mcp_server_t *srv, const char *reason)
 
     char projects[CBM_SZ_4K] = "";
     int count =
-        collect_db_project_names(dir_path, projects, sizeof(projects),
-                                 srv && srv->read_only);
+        collect_db_project_names(dir_path, projects, sizeof(projects), srv && srv->read_only);
 
     enum { ERR_BUF_SZ = 5120 };
     char buf[ERR_BUF_SZ];
@@ -2370,15 +2360,15 @@ static char *build_no_store_error(cbm_mcp_server_t *srv, const char *project) {
 }
 
 /* Bail with the right error when no store is available. */
-#define REQUIRE_STORE(store, project)                     \
-    do {                                                  \
-        if (!(store)) {                                   \
+#define REQUIRE_STORE(store, project)                        \
+    do {                                                     \
+        if (!(store)) {                                      \
             char *_err = build_no_store_error(srv, project); \
-            char *_res = cbm_mcp_text_result(_err, true); \
-            free(_err);                                   \
-            free(project);                                \
-            return _res;                                  \
-        }                                                 \
+            char *_res = cbm_mcp_text_result(_err, true);    \
+            free(_err);                                      \
+            free(project);                                   \
+            return _res;                                     \
+        }                                                    \
     } while (0)
 
 static bool project_has_adr(cbm_store_t *store, const char *project, const char *root_path,
@@ -2427,8 +2417,8 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     if (out_store) {
         *out_store = NULL;
     }
-    cbm_store_t *st = strict ? cbm_store_open_path_query_strict(full_path)
-                             : cbm_store_open_path_query(full_path);
+    cbm_store_t *st =
+        strict ? cbm_store_open_path_query_strict(full_path) : cbm_store_open_path_query(full_path);
     if (!st) {
         return false; /* nonexistent / unreadable */
     }
@@ -2546,8 +2536,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
      * they don't appear as resolvable projects. */
     char project_name[CBM_SZ_1K];
     cbm_store_t *pstore = NULL;
-    if (!db_internal_project_name(full_path, project_name, sizeof(project_name), strict,
-                                  &pstore)) {
+    if (!db_internal_project_name(full_path, project_name, sizeof(project_name), strict, &pstore)) {
         return; /* ghost / unreadable — not a resolvable project */
     }
     if (strict) {
@@ -2574,8 +2563,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         }
         cbm_project_free_fields(&proj);
     }
-    bool store_still_valid =
-        !strict || cbm_store_strict_snapshot_valid(pstore);
+    bool store_still_valid = !strict || cbm_store_strict_snapshot_valid(pstore);
     cbm_store_close(pstore);
     if (!store_still_valid) {
         return;
@@ -2715,9 +2703,8 @@ static char *verify_project_indexed(cbm_mcp_server_t *srv, cbm_store_t *store,
     cbm_project_t proj_check = {0};
     if (cbm_store_get_project(store, project, &proj_check) != CBM_STORE_OK) {
         char *err = build_project_list_error(
-            srv, srv && srv->read_only
-                     ? "project is not present in the sealed cache generation"
-                     : "project not indexed — run index_repository first");
+            srv, srv && srv->read_only ? "project is not present in the sealed cache generation"
+                                       : "project not indexed — run index_repository first");
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         return res;
@@ -2789,8 +2776,7 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     cbm_project_t proj_info = {0};
     if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
         bool strict_read_only = srv->read_only;
-        bool adr_exists =
-            project_has_adr(store, project, proj_info.root_path, strict_read_only);
+        bool adr_exists = project_has_adr(store, project, proj_info.root_path, strict_read_only);
         yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
         if (!adr_exists) {
             yyjson_mut_obj_add_str(
@@ -3011,9 +2997,8 @@ static bool sg_provenance_capture(cbm_store_t *store, const char *project,
     if (!active_branch_declared) {
         sqlite3 *db = cbm_store_get_db(store);
         sqlite3_stmt *stmt = NULL;
-        const char *sql =
-            "SELECT qualified_name FROM nodes "
-            "WHERE project=?1 AND label='Branch' ORDER BY qualified_name LIMIT 2;";
+        const char *sql = "SELECT qualified_name FROM nodes "
+                          "WHERE project=?1 AND label='Branch' ORDER BY qualified_name LIMIT 2;";
         if (!db || sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
             sg_provenance_clear(provenance);
             return false;
@@ -3050,10 +3035,8 @@ static bool sg_provenance_capture(cbm_store_t *store, const char *project,
 
     if (selected_branch_qn) {
         cbm_node_t branch = {0};
-        int branch_rc =
-            cbm_store_find_node_by_qn(store, project, selected_branch_qn, &branch);
-        if (branch_rc == CBM_STORE_OK && branch.label &&
-            strcmp(branch.label, "Branch") == 0) {
+        int branch_rc = cbm_store_find_node_by_qn(store, project, selected_branch_qn, &branch);
+        if (branch_rc == CBM_STORE_OK && branch.label && strcmp(branch.label, "Branch") == 0) {
             provenance->branch_qn = strdup(selected_branch_qn);
             yyjson_doc *properties_doc =
                 branch.properties_json
@@ -3061,10 +3044,9 @@ static bool sg_provenance_capture(cbm_store_t *store, const char *project,
                     : NULL;
             yyjson_val *properties_root =
                 properties_doc ? yyjson_doc_get_root(properties_doc) : NULL;
-            yyjson_val *head =
-                properties_root && yyjson_is_obj(properties_root)
-                    ? yyjson_obj_get(properties_root, "head_sha")
-                    : NULL;
+            yyjson_val *head = properties_root && yyjson_is_obj(properties_root)
+                                   ? yyjson_obj_get(properties_root, "head_sha")
+                                   : NULL;
             bool have_head = head && yyjson_is_str(head);
             if (have_head) {
                 provenance->head_sha = strdup(yyjson_get_str(head));
@@ -3130,18 +3112,14 @@ static void sg_add_trusted_snapshot_json(yyjson_mut_doc *doc, yyjson_mut_val *ro
     int indexed_files = -1;
     sqlite3 *db = cbm_store_get_db(store);
     sqlite3_stmt *stmt = NULL;
-    if (db &&
-        sqlite3_prepare_v2(db,
-                           "SELECT COUNT(*) FROM file_hashes WHERE project = ?1;",
-                           BM25_SQL_AUTO_LEN, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, SKIP_ONE, project, BM25_SQL_AUTO_LEN,
-                          MCP_SQLITE_TRANSIENT);
+    if (db && sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM file_hashes WHERE project = ?1;",
+                                 BM25_SQL_AUTO_LEN, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, SKIP_ONE, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
         int step_rc = sqlite3_step(stmt);
         if (step_rc == SQLITE_ROW) {
             indexed_files = sqlite3_column_int(stmt, 0);
             if (sqlite3_step(stmt) != SQLITE_DONE) {
-                cbm_store_mark_query_fault(store,
-                                           "coverage file count terminal");
+                cbm_store_mark_query_fault(store, "coverage file count terminal");
             }
         } else {
             cbm_store_mark_query_fault(store, "coverage file count");
@@ -3178,19 +3156,15 @@ static void sg_add_trusted_snapshot_json(yyjson_mut_doc *doc, yyjson_mut_val *ro
     cbm_store_free_coverage(rows, row_count);
 
     cbm_coverage_meta_t meta = {0};
-    bool have_meta =
-        cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK;
+    bool have_meta = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK;
     yyjson_mut_val *coverage = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_int(doc, coverage, "indexed_files", indexed_files);
     yyjson_mut_obj_add_int(doc, coverage, "parse_partial", parse_partial);
     yyjson_mut_obj_add_int(doc, coverage, "skipped", skipped);
-    yyjson_mut_obj_add_int(doc, coverage, "not_indexed_dirs",
-                           not_indexed_dirs);
-    yyjson_mut_obj_add_int(doc, coverage, "not_indexed_files",
-                           not_indexed_files);
+    yyjson_mut_obj_add_int(doc, coverage, "not_indexed_dirs", not_indexed_dirs);
+    yyjson_mut_obj_add_int(doc, coverage, "not_indexed_files", not_indexed_files);
     if (have_meta && meta.recording_status) {
-        yyjson_mut_obj_add_strcpy(doc, coverage, "recording_status",
-                                  meta.recording_status);
+        yyjson_mut_obj_add_strcpy(doc, coverage, "recording_status", meta.recording_status);
     } else {
         yyjson_mut_obj_add_str(doc, coverage, "recording_status", "unavailable");
     }
@@ -3266,8 +3240,7 @@ static char *bm25_file_pattern_like(const char *file_pattern) {
  * in which case the caller falls back to the regex-based search path. */
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
                          const char *file_pattern, int limit, int offset, bool toon,
-                         const sg_provenance_t *provenance,
-                         bool trusted_snapshot) {
+                         const sg_provenance_t *provenance, bool trusted_snapshot) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return NULL;
@@ -3363,8 +3336,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             if (count_rc == SQLITE_ROW) {
                 total = sqlite3_column_int(cs, 0);
                 if (sqlite3_step(cs) != SQLITE_DONE) {
-                    cbm_store_mark_query_fault(store,
-                                               "BM25 count terminal");
+                    cbm_store_mark_query_fault(store, "BM25 count terminal");
                 }
             } else {
                 cbm_store_mark_query_fault(store, "BM25 count");
@@ -3951,8 +3923,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     sg_provenance_t provenance = {0};
     bool snapshot_active = false;
     bool trusted_snapshot =
-        srv && srv->read_only && srv->git_tracked_only &&
-        srv->request_trusted_snapshot != NULL;
+        srv && srv->read_only && srv->git_tracked_only && srv->request_trusted_snapshot != NULL;
     if (legacy_json) {
         if (cbm_store_exec(store, "BEGIN;") != CBM_STORE_OK) {
             free(project);
@@ -3976,17 +3947,15 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset,
-                                      !legacy_json, legacy_json ? &provenance : NULL,
-                                      legacy_json && trusted_snapshot);
+        char *bm25_json =
+            bm25_search(store, project, query, q_file_pattern, q_limit, q_offset, !legacy_json,
+                        legacy_json ? &provenance : NULL, legacy_json && trusted_snapshot);
         free(q_file_pattern);
         if (bm25_json) {
-            bool snapshot_ok =
-                !snapshot_active || cbm_store_commit(store) == CBM_STORE_OK;
+            bool snapshot_ok = !snapshot_active || cbm_store_commit(store) == CBM_STORE_OK;
             if (!snapshot_ok) {
                 (void)cbm_store_rollback(store);
             }
-            snapshot_active = false;
             free(query);
             sg_provenance_clear(&provenance);
             free(project);
@@ -4220,7 +4189,6 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (!snapshot_ok) {
         (void)cbm_store_rollback(store);
     }
-    snapshot_active = false;
     sg_provenance_clear(&provenance);
 
     free(project);
@@ -4580,29 +4548,26 @@ static const char *coverage_path_freshness(cbm_mcp_server_t *srv, cbm_store_t *s
         unsigned char *bytes = NULL;
         size_t byte_count = 0;
         long configured_limit = cbm_max_file_bytes();
-        bool size_admitted =
-            hash.size >= 0 && configured_limit > 0 &&
-            (uintmax_t)hash.size <= (uintmax_t)configured_limit &&
-            (uintmax_t)hash.size <= (uintmax_t)SIZE_MAX;
+        bool size_admitted = hash.size >= 0 && configured_limit > 0 &&
+                             (uintmax_t)hash.size <= (uintmax_t)configured_limit &&
+                             (uintmax_t)hash.size <= (uintmax_t)SIZE_MAX;
         size_t expected_size = size_admitted ? (size_t)hash.size : 0U;
         /* trusted_fs reserves zero for "unbounded". An empty recorded file
          * still gets a one-byte ceiling, then the exact-size check below. */
         size_t read_limit = expected_size > 0U ? expected_size : 1U;
         bool test_gate_open =
             !srv->trusted_source_read_test_hook ||
-            srv->trusted_source_read_test_hook(
-                srv->trusted_source_read_test_context, root_path, rel_path,
-                read_limit);
-        bool read_ok =
-            size_admitted && test_gate_open &&
-            hash.sha256 && strlen(hash.sha256) == CBM_SHA256_HEX_LEN &&
-            cbm_trusted_root_open(root_path, &trusted_root) == 0 &&
-            cbm_trusted_root_read_file(trusted_root, rel_path, read_limit, &bytes,
-                                       &byte_count, NULL) == 0;
-        char digest[CBM_SHA256_HEX_LEN + 1] = {0};
+            srv->trusted_source_read_test_hook(srv->trusted_source_read_test_context, root_path,
+                                               rel_path, read_limit);
+        bool read_ok = size_admitted && test_gate_open && hash.sha256 &&
+                       strlen(hash.sha256) == CBM_SHA256_HEX_LEN &&
+                       cbm_trusted_root_open(root_path, &trusted_root) == 0 &&
+                       cbm_trusted_root_read_file(trusted_root, rel_path, read_limit, &bytes,
+                                                  &byte_count, NULL) == 0;
         if (read_ok) {
             read_ok = byte_count == expected_size;
             if (read_ok) {
+                char digest[CBM_SHA256_HEX_LEN + 1] = {0};
                 cbm_sha256_hex(bytes, byte_count, digest);
                 read_ok = strcmp(digest, hash.sha256) == 0;
             }
@@ -4740,9 +4705,8 @@ static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
 }
 
 static const char *coverage_recommended_action(const char *status, const char *freshness) {
-    if (!freshness ||
-        (strcmp(freshness, "metadata_match") != 0 &&
-         strcmp(freshness, "trusted_content_match") != 0)) {
+    if (!freshness || (strcmp(freshness, "metadata_match") != 0 &&
+                       strcmp(freshness, "trusted_content_match") != 0)) {
         return "read_source_and_reindex";
     }
     if (strcmp(status, "partial") == 0) {
@@ -4852,11 +4816,10 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
             }
             bool outside = false;
             bool path_trusted_failure = false;
-            const char *freshness = coverage_path_freshness(
-                srv, store, project, have_project ? proj.root_path : NULL, rel,
-                &outside, &path_trusted_failure);
-            trusted_source_failure =
-                trusted_source_failure || path_trusted_failure;
+            const char *freshness =
+                coverage_path_freshness(srv, store, project, have_project ? proj.root_path : NULL,
+                                        rel, &outside, &path_trusted_failure);
+            trusted_source_failure = trusted_source_failure || path_trusted_failure;
             const char *status = outside ? "outside_project"
                                          : coverage_status(rows, row_count, rel, recording_status,
                                                            generation_matches, lookup_ok);
@@ -4952,10 +4915,9 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     free(project);
     char *result =
         trusted_source_failure
-            ? cbm_mcp_text_result(
-                  "trusted coverage source read or hash validation failed; "
-                  "discarding result",
-                  true)
+            ? cbm_mcp_text_result("trusted coverage source read or hash validation failed; "
+                                  "discarding result",
+                                  true)
             : cbm_mcp_text_result(json, false);
     free(json);
     return result;
@@ -4969,8 +4931,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     bool trusted_status = srv->read_only && srv->git_tracked_only;
     if (trusted_status && !sg_provenance_capture(store, project, &provenance)) {
         free(project);
-        return cbm_mcp_text_result(
-            "trusted snapshot provenance is missing or unreadable", true);
+        return cbm_mcp_text_result("trusted snapshot provenance is missing or unreadable", true);
     }
     /* The git context block (worktree/shadow path variants) only matters when
      * debugging index-location issues — gate it so the common status call
@@ -5637,8 +5598,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     /* Counts-only: this handler renders label/type counts but never property
      * keys, and full key discovery json_each-scans every row (seconds-to-
      * minutes on multi-million-node graphs). */
-    if (cbm_store_get_schema_counts_scoped(store, project, scope_path, &schema) !=
-        CBM_STORE_OK) {
+    if (cbm_store_get_schema_counts_scoped(store, project, scope_path, &schema) != CBM_STORE_OK) {
         cbm_store_schema_free(&schema);
         if (aspects_doc) {
             yyjson_doc_free(aspects_doc);
@@ -5649,8 +5609,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
 
     cbm_architecture_info_t arch = {0};
-    if (cbm_store_get_architecture(store, project, scope_path, aspects_strs,
-                                   aspects_strs_count, &arch) != CBM_STORE_OK) {
+    if (cbm_store_get_architecture(store, project, scope_path, aspects_strs, aspects_strs_count,
+                                   &arch) != CBM_STORE_OK) {
         cbm_store_architecture_free(&arch);
         cbm_store_schema_free(&schema);
         if (aspects_doc) {
@@ -8692,10 +8652,9 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
     return false;
 }
 
-static char *resolve_snippet_source(cbm_mcp_server_t *srv, cbm_store_t *store,
-                                    const char *project, const char *root_path,
-                                    const char *file_path, int start, int end,
-                                    char **out_abs_path) {
+static char *resolve_snippet_source(cbm_mcp_server_t *srv, cbm_store_t *store, const char *project,
+                                    const char *root_path, const char *file_path, int start,
+                                    int end, char **out_abs_path) {
     *out_abs_path = NULL;
     if (!root_path || !file_path) {
         return NULL;
@@ -8722,24 +8681,21 @@ static char *resolve_snippet_source(cbm_mcp_server_t *srv, cbm_store_t *store,
         size_t limit = configured_limit > 0 ? (size_t)configured_limit : 0;
         bool test_gate_open =
             !srv->trusted_source_read_test_hook ||
-            srv->trusted_source_read_test_hook(
-                srv->trusted_source_read_test_context, root_path, file_path,
-                limit);
+            srv->trusted_source_read_test_hook(srv->trusted_source_read_test_context, root_path,
+                                               file_path, limit);
         bool admitted =
-            test_gate_open &&
-            store && project &&
+            test_gate_open && store && project &&
             cbm_trusted_root_open(root_path, &trusted_root) == 0 &&
-            cbm_trusted_root_read_file(trusted_root, file_path, limit, &bytes,
-                                       &byte_count, NULL) == 0 &&
+            cbm_trusted_root_read_file(trusted_root, file_path, limit, &bytes, &byte_count, NULL) ==
+                0 &&
             cbm_store_get_file_hash(store, project, file_path, &stored) == CBM_STORE_OK &&
             stored.sha256 && stored.sha256[0];
-        char digest[CBM_SHA256_HEX_LEN + 1] = {0};
         if (admitted) {
+            char digest[CBM_SHA256_HEX_LEN + 1] = {0};
             cbm_sha256_hex(bytes, byte_count, digest);
             admitted = strcmp(digest, stored.sha256) == 0;
         }
-        char *source =
-            admitted ? read_buffer_lines(bytes, byte_count, start, end) : NULL;
+        char *source = admitted ? read_buffer_lines(bytes, byte_count, start, end) : NULL;
         cbm_store_clear_file_hash(&stored);
         free(bytes);
         cbm_trusted_root_close(trusted_root);
@@ -8886,9 +8842,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         snippet_clipped = true;
     }
     char *abs_path = NULL;
-    char *source =
-        resolve_snippet_source(srv, srv->store, node->project, root_path,
-                               node->file_path, start, end, &abs_path);
+    char *source = resolve_snippet_source(srv, srv->store, node->project, root_path,
+                                          node->file_path, start, end, &abs_path);
     bool trusted_source_required = srv && srv->read_only && srv->git_tracked_only;
     char *safe_source = source ? sanitize_utf8_lossy(source) : NULL;
     if (trusted_source_required && !safe_source) {
@@ -8896,8 +8851,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
         free(abs_path);
         free(source);
         return cbm_mcp_text_result(
-            "trusted source read or hash validation failed; discarding the snippet",
-            true);
+            "trusted source read or hash validation failed; discarding the snippet", true);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -10202,8 +10156,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
         }
-        return cbm_mcp_text_result(
-            "search refused: indexed tracked-file scope is unavailable", true);
+        return cbm_mcp_text_result("search refused: indexed tracked-file scope is unavailable",
+                                   true);
     }
 
     /* Collect grep matches into array */
@@ -11266,17 +11220,13 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 static bool mcp_tool_requires_fresh_snapshot(const char *name) {
-    return name && (strcmp(name, "search_graph") == 0 ||
-                    strcmp(name, "query_graph") == 0 ||
-                    strcmp(name, "trace_path") == 0 ||
-                    strcmp(name, "trace_call_path") == 0 ||
-                    strcmp(name, "get_code_snippet") == 0 ||
-                    strcmp(name, "get_graph_schema") == 0 ||
-                    strcmp(name, "get_architecture") == 0 ||
-                    strcmp(name, "search_code") == 0 ||
-                    strcmp(name, "index_status") == 0 ||
-                    strcmp(name, "check_index_coverage") == 0 ||
-                    strcmp(name, "detect_changes") == 0);
+    return name &&
+           (strcmp(name, "search_graph") == 0 || strcmp(name, "query_graph") == 0 ||
+            strcmp(name, "trace_path") == 0 || strcmp(name, "trace_call_path") == 0 ||
+            strcmp(name, "get_code_snippet") == 0 || strcmp(name, "get_graph_schema") == 0 ||
+            strcmp(name, "get_architecture") == 0 || strcmp(name, "search_code") == 0 ||
+            strcmp(name, "index_status") == 0 || strcmp(name, "check_index_coverage") == 0 ||
+            strcmp(name, "detect_changes") == 0);
 }
 
 static void mcp_clear_request_trusted_snapshot(cbm_mcp_server_t *srv) {
@@ -11287,8 +11237,7 @@ static void mcp_clear_request_trusted_snapshot(cbm_mcp_server_t *srv) {
     srv->request_trusted_snapshot = NULL;
 }
 
-static char *mcp_admit_current_trusted_snapshot(cbm_mcp_server_t *srv,
-                                                const char *tool_name,
+static char *mcp_admit_current_trusted_snapshot(cbm_mcp_server_t *srv, const char *tool_name,
                                                 const char *args_json) {
     mcp_clear_request_trusted_snapshot(srv);
     if (!srv || !srv->read_only || !srv->git_tracked_only ||
@@ -11307,10 +11256,9 @@ static char *mcp_admit_current_trusted_snapshot(cbm_mcp_server_t *srv,
         return cbm_mcp_text_result(
             "project root is outside the session's allowed repository boundary", true);
     }
-    bool current =
-        store && root &&
-        cbm_pipeline_trusted_snapshot_admit(
-            root, project, store, &srv->request_trusted_snapshot) == 0;
+    bool current = store && root &&
+                   cbm_pipeline_trusted_snapshot_admit(root, project, store,
+                                                       &srv->request_trusted_snapshot) == 0;
     free(root);
     free(project);
     if (current) {
@@ -11325,15 +11273,12 @@ static char *mcp_verify_current_trusted_snapshot(cbm_mcp_server_t *srv) {
     if (!srv || !srv->request_trusted_snapshot) {
         return NULL;
     }
-    bool current =
-        cbm_pipeline_trusted_snapshot_verify(srv->request_trusted_snapshot);
+    bool current = cbm_pipeline_trusted_snapshot_verify(srv->request_trusted_snapshot);
     mcp_clear_request_trusted_snapshot(srv);
-    return current
-               ? NULL
-               : cbm_mcp_text_result(
-                     "trusted snapshot changed while the request was running; "
-                     "discarding the result",
-                     true);
+    return current ? NULL
+                   : cbm_mcp_text_result("trusted snapshot changed while the request was running; "
+                                         "discarding the result",
+                                         true);
 }
 
 static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -11348,12 +11293,11 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (srv && srv->read_only && mcp_tool_blocked_read_only(tool_name)) {
         char message[CBM_SZ_256];
-        snprintf(message, sizeof(message),
-                 "tool '%s' is disabled because CBM_READ_ONLY=1", tool_name);
+        snprintf(message, sizeof(message), "tool '%s' is disabled because CBM_READ_ONLY=1",
+                 tool_name);
         return cbm_mcp_text_result(message, true);
     }
-    char *freshness_error =
-        mcp_admit_current_trusted_snapshot(srv, tool_name, args_json);
+    char *freshness_error = mcp_admit_current_trusted_snapshot(srv, tool_name, args_json);
     if (freshness_error) {
         return freshness_error;
     }
@@ -11452,15 +11396,13 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
      * Every admitted request is verified exactly once, regardless of the
      * handler's result. */
     char *post_read_error =
-        srv && srv->request_trusted_snapshot
-            ? mcp_verify_current_trusted_snapshot(srv)
-            : NULL;
+        srv && srv->request_trusted_snapshot ? mcp_verify_current_trusted_snapshot(srv) : NULL;
     if (!post_read_error && srv && srv->read_only && srv->store &&
         !cbm_store_strict_snapshot_valid(srv->store)) {
-        post_read_error = cbm_mcp_text_result(
-            "sealed database generation changed while the request was running; "
-            "discarding the result",
-            true);
+        post_read_error =
+            cbm_mcp_text_result("sealed database generation changed while the request was running; "
+                                "discarding the result",
+                                true);
     }
     if (post_read_error) {
         free(result);
@@ -11526,8 +11468,8 @@ static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
 /* Register the session project with the background watcher for ongoing
  * change detection — unless auto_watch is disabled. */
 static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
-    if (srv->read_only || !srv->watcher ||
-        srv->session_project[0] == '\0' || srv->session_root[0] == '\0') {
+    if (srv->read_only || !srv->watcher || srv->session_project[0] == '\0' ||
+        srv->session_root[0] == '\0') {
         return;
     }
     if (!auto_watch_enabled(srv)) {
@@ -11744,8 +11686,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
 
     if (strcmp(req.method, "initialize") == 0) {
         result_json = cbm_mcp_initialize_response_for_profile(
-            req.params_raw, srv->tool_profile, srv->read_only,
-            srv->git_tracked_only);
+            req.params_raw, srv->tool_profile, srv->read_only, srv->git_tracked_only);
         detect_session(srv);
         if (!srv->read_only && srv->background_tasks &&
             srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
@@ -11765,8 +11706,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "prompts/get") == 0) {
         result_json = cbm_mcp_prompt_get(req.params_raw, &request_error_json);
     } else if (strcmp(req.method, "tools/list") == 0) {
-        result_json =
-            cbm_mcp_tools_list_page(srv->tool_profile, req.params_raw, srv->read_only);
+        result_json = cbm_mcp_tools_list_page(srv->tool_profile, req.params_raw, srv->read_only);
     } else if (strcmp(req.method, "tools/call") == 0) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =

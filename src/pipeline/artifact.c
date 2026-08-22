@@ -75,8 +75,8 @@ void cbm_artifact_set_snapshot_path_hook_for_test(cbm_artifact_snapshot_path_hoo
     g_snapshot_path_hook_context = context;
 }
 
-void cbm_artifact_set_payload_published_hook_for_test(
-    cbm_artifact_payload_published_hook_fn hook, void *context) {
+void cbm_artifact_set_payload_published_hook_for_test(cbm_artifact_payload_published_hook_fn hook,
+                                                      void *context) {
     g_payload_published_hook = hook;
     g_payload_published_hook_context = context;
 }
@@ -188,10 +188,9 @@ static bool artifact_directory_revalidate(const artifact_directory_t *directory)
 #endif
     int probe = open(directory->path, flags);
     bool valid = directory->fd >= 0 && probe >= 0 && fstat(directory->fd, &pinned) == 0 &&
-                 fstat(probe, &named) == 0 && S_ISDIR(pinned.st_mode) &&
-                 S_ISDIR(named.st_mode) && pinned.st_dev == directory->device &&
-                 pinned.st_ino == directory->inode && named.st_dev == directory->device &&
-                 named.st_ino == directory->inode;
+                 fstat(probe, &named) == 0 && S_ISDIR(pinned.st_mode) && S_ISDIR(named.st_mode) &&
+                 pinned.st_dev == directory->device && pinned.st_ino == directory->inode &&
+                 named.st_dev == directory->device && named.st_ino == directory->inode;
     if (probe >= 0) {
         (void)close(probe);
     }
@@ -250,7 +249,8 @@ static bool artifact_win_child_revalidate(const artifact_directory_t *directory,
                         : INVALID_HANDLE_VALUE;
     free(path);
     BY_HANDLE_FILE_INFORMATION named;
-    bool valid = artifact_win_regular_handle(probe, &named) && artifact_win_same_file(&actual, &named);
+    bool valid =
+        artifact_win_regular_handle(probe, &named) && artifact_win_same_file(&actual, &named);
     if (probe != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(probe);
     }
@@ -301,9 +301,10 @@ static bool artifact_directory_open(const char *repo_path, bool create,
 #else
     directory->fd = -1;
 #endif
-    int repo_written = snprintf(directory->repo_path, sizeof(directory->repo_path), "%s", repo_path);
-    int path_written = snprintf(directory->path, sizeof(directory->path), "%s/%s", repo_path,
-                                CBM_ARTIFACT_DIR);
+    int repo_written =
+        snprintf(directory->repo_path, sizeof(directory->repo_path), "%s", repo_path);
+    int path_written =
+        snprintf(directory->path, sizeof(directory->path), "%s/%s", repo_path, CBM_ARTIFACT_DIR);
     if (repo_written <= 0 || (size_t)repo_written >= sizeof(directory->repo_path) ||
         path_written <= 0 || (size_t)path_written >= sizeof(directory->path) ||
         cbm_trusted_root_open(repo_path, &directory->repo_root) != 0) {
@@ -456,8 +457,7 @@ static bool artifact_create_gitattributes(artifact_directory_t *directory) {
         struct stat by_name;
         bool safe = existing >= 0 && fstat(existing, &by_handle) == 0 &&
                     S_ISREG(by_handle.st_mode) && by_handle.st_nlink == 1 &&
-                    fstatat(directory->fd, ".gitattributes", &by_name,
-                            AT_SYMLINK_NOFOLLOW) == 0 &&
+                    fstatat(directory->fd, ".gitattributes", &by_name, AT_SYMLINK_NOFOLLOW) == 0 &&
                     S_ISREG(by_name.st_mode) && by_name.st_dev == by_handle.st_dev &&
                     by_name.st_ino == by_handle.st_ino;
         if (existing >= 0) {
@@ -524,9 +524,8 @@ static bool artifact_lock_acquire(artifact_directory_t *directory, bool exclusiv
     return true;
 }
 
-static char *artifact_read_file_alloc(const artifact_directory_t *directory,
-                                      const char *base_name, size_t max_bytes,
-                                      size_t *out_len) {
+static char *artifact_read_file_alloc(const artifact_directory_t *directory, const char *base_name,
+                                      size_t max_bytes, size_t *out_len) {
     if (!directory || !artifact_base_name_valid(base_name) || !out_len ||
         !artifact_directory_revalidate(directory)) {
         return NULL;
@@ -562,9 +561,8 @@ static char *artifact_read_file_alloc(const artifact_directory_t *directory,
 #endif
     int file = openat(directory->fd, base_name, flags);
     struct stat before;
-    if (file < 0 || fstat(file, &before) != 0 || !S_ISREG(before.st_mode) ||
-        before.st_nlink != 1 || before.st_size <= 0 ||
-        (uintmax_t)before.st_size > (uintmax_t)(SIZE_MAX - 1U) ||
+    if (file < 0 || fstat(file, &before) != 0 || !S_ISREG(before.st_mode) || before.st_nlink != 1 ||
+        before.st_size <= 0 || (uintmax_t)before.st_size > (uintmax_t)(SIZE_MAX - 1U) ||
         (max_bytes != 0 && (uintmax_t)before.st_size > (uintmax_t)max_bytes)) {
         if (file >= 0) {
             (void)close(file);
@@ -594,10 +592,9 @@ static char *artifact_read_file_alloc(const artifact_directory_t *directory,
         } while (extra_read < 0 && errno == EINTR);
     }
     struct stat after;
-    ok = ok && extra_read == 0 && fstat(file, &after) == 0 &&
-         before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
-         before.st_size == after.st_size && before.st_mtime == after.st_mtime &&
-         before.st_ctime == after.st_ctime &&
+    ok = ok && extra_read == 0 && fstat(file, &after) == 0 && before.st_dev == after.st_dev &&
+         before.st_ino == after.st_ino && before.st_size == after.st_size &&
+         before.st_mtime == after.st_mtime && before.st_ctime == after.st_ctime &&
          ARTIFACT_MTIME_NS(before) == ARTIFACT_MTIME_NS(after) &&
          ARTIFACT_CTIME_NS(before) == ARTIFACT_CTIME_NS(after);
     (void)close(file);
@@ -614,15 +611,15 @@ static char *artifact_read_file_alloc(const artifact_directory_t *directory,
 }
 
 static bool artifact_unique_temp_name(const char *target, char *out, size_t out_size) {
-    uint64_t sequence = atomic_fetch_add_explicit(&g_artifact_temp_sequence, 1,
-                                                   memory_order_relaxed) + 1U;
+    uint64_t sequence =
+        atomic_fetch_add_explicit(&g_artifact_temp_sequence, 1, memory_order_relaxed) + 1U;
 #ifdef _WIN32
     unsigned long process = (unsigned long)GetCurrentProcessId();
 #else
     unsigned long process = (unsigned long)getpid();
 #endif
-    int written = snprintf(out, out_size, ".%s.tmp-%lu-%llu", target, process,
-                           (unsigned long long)sequence);
+    int written =
+        snprintf(out, out_size, ".%s.tmp-%lu-%llu", target, process, (unsigned long long)sequence);
     return written > 0 && (size_t)written < out_size;
 }
 
@@ -686,16 +683,17 @@ static int artifact_stage_file(artifact_directory_t *directory, const char *targ
 
 #ifdef _WIN32
     wchar_t *temp_path = artifact_win_child_path(directory, staged->name);
-    HANDLE file = temp_path ? CreateFileW(temp_path, GENERIC_WRITE | FILE_READ_ATTRIBUTES,
-                                          FILE_SHARE_READ, NULL, CREATE_NEW,
-                                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL)
-                            : INVALID_HANDLE_VALUE;
+    HANDLE file =
+        temp_path
+            ? CreateFileW(temp_path, GENERIC_WRITE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL,
+                          CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL)
+            : INVALID_HANDLE_VALUE;
     DWORD open_error = file == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
     BY_HANDLE_FILE_INFORMATION identity;
     bool opened = artifact_win_regular_handle(file, &identity) &&
                   artifact_win_child_revalidate(directory, staged->name, file, &identity);
-    bool written = opened && artifact_write_all_native(file, data, length) &&
-                   FlushFileBuffers(file) != 0;
+    bool written =
+        opened && artifact_write_all_native(file, data, length) && FlushFileBuffers(file) != 0;
     bool closed = file != INVALID_HANDLE_VALUE && CloseHandle(file) != 0;
     free(temp_path);
     if (!opened || !written || !closed) {
@@ -732,9 +730,8 @@ static int artifact_stage_file(artifact_directory_t *directory, const char *targ
     return 0;
 }
 
-static int artifact_publish_staged(artifact_directory_t *directory,
-                                   artifact_staged_file_t *staged, const char *target,
-                                   artifact_file_error_t *out_err) {
+static int artifact_publish_staged(artifact_directory_t *directory, artifact_staged_file_t *staged,
+                                   const char *target, artifact_file_error_t *out_err) {
     file_error_clear(out_err);
     if (!directory || !staged || !staged->exists || !artifact_base_name_valid(target) ||
         !artifact_directory_revalidate(directory)) {
@@ -744,9 +741,9 @@ static int artifact_publish_staged(artifact_directory_t *directory,
 #ifdef _WIN32
     wchar_t *temporary = artifact_win_child_path(directory, staged->name);
     wchar_t *destination = artifact_win_child_path(directory, target);
-    BOOL renamed = temporary && destination &&
-                   MoveFileExW(temporary, destination,
-                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    BOOL renamed =
+        temporary && destination &&
+        MoveFileExW(temporary, destination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
     free(temporary);
     free(destination);
@@ -942,8 +939,7 @@ static bool artifact_sha256_string_valid(const char *digest) {
         return false;
     }
     for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++) {
-        if (!((digest[i] >= '0' && digest[i] <= '9') ||
-              (digest[i] >= 'a' && digest[i] <= 'f'))) {
+        if (!((digest[i] >= '0' && digest[i] <= '9') || (digest[i] >= 'a' && digest[i] <= 'f'))) {
             return false;
         }
     }
@@ -1119,8 +1115,8 @@ static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool str
         *out_size = 0;
     }
     char snapshot_dir[CBM_SZ_4K];
-    int directory_written = snprintf(snapshot_dir, sizeof(snapshot_dir),
-                                     "%s/cbm-artifact-XXXXXX", cbm_tmpdir());
+    int directory_written =
+        snprintf(snapshot_dir, sizeof(snapshot_dir), "%s/cbm-artifact-XXXXXX", cbm_tmpdir());
     if (directory_written <= 0 || (size_t)directory_written >= sizeof(snapshot_dir) ||
         !cbm_mkdtemp(snapshot_dir)) {
         artifact_export_fail("prepare_snapshot_dir", cbm_tmpdir(), "mkdtemp", errno);
@@ -1200,7 +1196,8 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
     artifact_directory_t directory;
     if (!artifact_directory_open(repo_path, true, &directory)) {
-        return artifact_export_fail("prepare_artifact_dir", repo_path, "unsafe_or_unopenable", errno);
+        return artifact_export_fail("prepare_artifact_dir", repo_path, "unsafe_or_unopenable",
+                                    errno);
     }
     if (!artifact_create_gitattributes(&directory)) {
         artifact_directory_close(&directory);
@@ -1376,10 +1373,9 @@ static bool artifact_path_entry_absent(const char *path) {
     if (!wide) {
         return false;
     }
-    HANDLE entry = CreateFileW(wide, FILE_READ_ATTRIBUTES,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                               OPEN_EXISTING,
-                               FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    HANDLE entry = CreateFileW(
+        wide, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     DWORD error = entry == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
     if (entry != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(entry);
@@ -1401,8 +1397,7 @@ static bool artifact_cache_destination_absent(const char *cache_db_path) {
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
         char path[CBM_SZ_4K];
         int written = snprintf(path, sizeof(path), "%s%s", cache_db_path, suffixes[i]);
-        if (written <= 0 || (size_t)written >= sizeof(path) ||
-            !artifact_path_entry_absent(path)) {
+        if (written <= 0 || (size_t)written >= sizeof(path) || !artifact_path_entry_absent(path)) {
             return false;
         }
     }
@@ -1533,8 +1528,7 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
      * lock through cache publication: an exporter cannot advance the source
      * generation and let an older import publish last. */
     char tmp_path[CBM_SZ_4K];
-    int temp_written =
-        snprintf(tmp_path, sizeof(tmp_path), "%s.import-XXXXXX", cache_db_path);
+    int temp_written = snprintf(tmp_path, sizeof(tmp_path), "%s.import-XXXXXX", cache_db_path);
     if (temp_written <= 0 || (size_t)temp_written >= sizeof(tmp_path)) {
         free(decompressed);
         artifact_directory_close(&directory);
@@ -1646,8 +1640,8 @@ bool cbm_artifact_exists(const char *repo_path) {
     artifact_metadata_t metadata;
     char *payload = NULL;
     size_t payload_size = 0;
-    bool exists = artifact_read_valid_bundle(&directory, &document, &metadata, &payload,
-                                             &payload_size);
+    bool exists =
+        artifact_read_valid_bundle(&directory, &document, &metadata, &payload, &payload_size);
     free(payload);
     if (document) {
         yyjson_doc_free(document);

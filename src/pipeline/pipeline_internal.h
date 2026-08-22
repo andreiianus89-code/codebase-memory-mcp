@@ -71,12 +71,10 @@ typedef struct {
     int64_t size;
 } cbm_file_snapshot_t;
 
-int cbm_pipeline_capture_file_snapshots(cbm_pipeline_t *p,
-                                        cbm_file_info_t *files, int file_count,
+int cbm_pipeline_capture_file_snapshots(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         cbm_file_snapshot_t **out);
-int cbm_pipeline_verify_file_snapshots(const cbm_pipeline_t *p,
-                                       const cbm_file_info_t *files, int file_count,
-                                       cbm_file_snapshot_t *snapshots);
+int cbm_pipeline_verify_file_snapshots(const cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                       int file_count, cbm_file_snapshot_t *snapshots);
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
@@ -152,8 +150,7 @@ void cbm_pipeline_mark_error_recording_failed(cbm_pipeline_t *p);
 
 /* A parser must consume exactly the size it measured. In trusted mode any
  * short read latches a fatal input error so the staging DB cannot publish. */
-bool cbm_pipeline_fread_exact(cbm_pipeline_t *p, FILE *stream, void *buffer,
-                              size_t byte_count);
+bool cbm_pipeline_fread_exact(cbm_pipeline_t *p, FILE *stream, void *buffer, size_t byte_count);
 void cbm_pipeline_set_parser_read_limit_for_tests(cbm_pipeline_t *p, size_t byte_count);
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
@@ -230,9 +227,10 @@ int cbm_pkgmap_scan_repo_trusted(const char *repo_path, cbm_pkg_entries_t *entri
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
                                          int file_count, const char *project_name,
                                          char **excluded_dirs, int excluded_count);
-CBMHashTable *cbm_pkgmap_build_from_repo_trusted(
-    const char *repo_path, const cbm_file_info_t *files, int file_count, const char *project_name,
-    char **excluded_dirs, int excluded_count, cbm_pipeline_t *pipeline);
+CBMHashTable *cbm_pkgmap_build_from_repo_trusted(const char *repo_path,
+                                                 const cbm_file_info_t *files, int file_count,
+                                                 const char *project_name, char **excluded_dirs,
+                                                 int excluded_count, cbm_pipeline_t *pipeline);
 CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
                                           const char *project_name);
 
@@ -681,8 +679,7 @@ atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 bool cbm_pipeline_git_tracked_only(const cbm_pipeline_t *p);
 bool cbm_pipeline_path_is_tracked(const cbm_pipeline_t *p, const char *rel_path);
 bool cbm_pipeline_path_is_auxiliary(const cbm_pipeline_t *p, const char *rel_path);
-void cbm_pipeline_get_auxiliary_files(const cbm_pipeline_t *p,
-                                      const cbm_file_info_t **out_files,
+void cbm_pipeline_get_auxiliary_files(const cbm_pipeline_t *p, const cbm_file_info_t **out_files,
                                       const cbm_file_snapshot_t **out_snapshots, int *out_count);
 int cbm_pipeline_verify_git_snapshot(const cbm_pipeline_t *p);
 int cbm_pipeline_upsert_branch_metadata(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);

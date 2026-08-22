@@ -564,8 +564,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 cbm_log_warn("index.file_oversized", "path", rel, "size_mb",
                              itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                              itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM ||
-                       rst == CBM_READ_SHORT) {
+            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM || rst == CBM_READ_SHORT) {
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
             }
             /* CBM_READ_EMPTY: benign 0-byte file — nothing to index, not reported. */

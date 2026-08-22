@@ -1098,9 +1098,8 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * owner-only path by the same already-compromised OS account is outside
      * the v1 threat boundary; cross-account and unsafe filesystem states fail
      * here before any daemon/cohort state is opened. */
-    bool cache_private =
-        read_only ? cbm_daemon_ipc_private_directory_validate(canonical_cache)
-                  : cbm_daemon_ipc_private_directory_secure(canonical_cache);
+    bool cache_private = read_only ? cbm_daemon_ipc_private_directory_validate(canonical_cache)
+                                   : cbm_daemon_ipc_private_directory_secure(canonical_cache);
     if (!cache_private) {
         return MAIN_BUILD_IDENTITY_CACHE_PRIVATE;
     }

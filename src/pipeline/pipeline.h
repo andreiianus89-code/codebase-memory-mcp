@@ -64,8 +64,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p);
  * every source/auxiliary input once and retains only metadata/digests. The
  * caller must verify after the read and then free the snapshot. */
 int cbm_pipeline_trusted_snapshot_admit(const char *repo_path, const char *project,
-                                        cbm_store_t *store,
-                                        cbm_trusted_snapshot_t **out);
+                                        cbm_store_t *store, cbm_trusted_snapshot_t **out);
 bool cbm_pipeline_trusted_snapshot_verify(cbm_trusted_snapshot_t *snapshot);
 void cbm_pipeline_trusted_snapshot_free(cbm_trusted_snapshot_t *snapshot);
 

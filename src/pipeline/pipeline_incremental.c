@@ -195,8 +195,7 @@ static void free_deleted_files(char **deleted, int count) {
     free(deleted);
 }
 
-static bool append_deleted_file(char ***deleted, int *count, int *capacity,
-                                const char *rel_path) {
+static bool append_deleted_file(char ***deleted, int *count, int *capacity, const char *rel_path) {
     if (*count >= *capacity) {
         int next_capacity = *capacity * PAIR_LEN;
         char **grown = realloc(*deleted, (size_t)next_capacity * sizeof(**deleted));
@@ -333,8 +332,8 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
 
         /* File is truly gone — record for purge. */
         if (!append_deleted_file(&deleted, &del_count, &del_cap, stored[i].rel_path)) {
-            cbm_log_error("incremental.err", "msg", "find_deleted_files_append_failed",
-                          "rel_path", stored[i].rel_path);
+            cbm_log_error("incremental.err", "msg", "find_deleted_files_append_failed", "rel_path",
+                          stored[i].rel_path);
             goto fail;
         }
     }
@@ -507,9 +506,9 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
  * Every row is attempted so logs identify all failures, but any failed
  * upsert rejects the staging generation. Atomic publication makes preserving
  * the complete previous generation safer than installing partial metadata. */
-static int persist_hashes(cbm_store_t *store, const char *project,
-                          cbm_file_info_t *files, int file_count,
-                          const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
+static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
+                          int file_count, const cbm_file_hash_t *mode_skipped,
+                          int mode_skipped_count) {
     int current_failed = 0;
     int ms_failed = 0;
 
@@ -693,8 +692,8 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path,
-                            const char *project, cbm_file_info_t *files, int file_count,
+static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+                            cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                             const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template) {
@@ -949,8 +948,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
 
-    cbm_path_alias_collection_t *path_aliases = cbm_load_path_aliases_trusted(
-        cbm_pipeline_repo_path(p), excluded_dirs, excluded_count, p);
+    cbm_path_alias_collection_t *path_aliases =
+        cbm_load_path_aliases_trusted(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count, p);
 
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -1092,9 +1091,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = 1,
     };
-    int persist_rc =
-        dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                         mode_skipped_count, cov, cov_n, &coverage_meta);
+    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+                                      mode_skipped_count, cov, cov_n, &coverage_meta);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);

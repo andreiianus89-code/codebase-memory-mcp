@@ -36,9 +36,8 @@ char *cbm_git_context_props_json_alloc(const cbm_git_context_t *ctx);
  * sorted and deduplicated. Filenames are read from `git ls-files -z`, so
  * whitespace and newlines are preserved. */
 int cbm_git_list_tracked_files(const char *repo_path, char ***out, int *count);
-int cbm_git_list_tracked_files_trusted(const char *repo_path,
-                                       const cbm_trusted_root_t *root, char ***out,
-                                       int *count);
+int cbm_git_list_tracked_files_trusted(const char *repo_path, const cbm_trusted_root_t *root,
+                                       char ***out, int *count);
 void cbm_git_free_tracked_files(char **files, int count);
 
 /* Deterministic instrumentation for trusted-runner regression/perf tests. */

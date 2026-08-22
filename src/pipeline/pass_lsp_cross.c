@@ -774,8 +774,7 @@ static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *mar
         int auxiliary_count = 0;
         cbm_pipeline_get_auxiliary_files(ctx->pipeline, &auxiliary, NULL, &auxiliary_count);
         for (int i = 0; i < auxiliary_count; i++) {
-            if (auxiliary[i].rel_path &&
-                strcmp(auxiliary[i].rel_path, "Cargo.toml") == 0) {
+            if (auxiliary[i].rel_path && strcmp(auxiliary[i].rel_path, "Cargo.toml") == 0) {
                 manifest_path = auxiliary[i].path;
                 break;
             }

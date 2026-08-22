@@ -63,8 +63,8 @@ typedef struct {
 } cbm_daemon_application_update_ops_t;
 
 typedef struct {
-    struct cbm_watcher *watcher;                           /* borrowed; daemon lifetime */
-    struct cbm_config *config;                             /* borrowed; daemon lifetime */
+    struct cbm_watcher *watcher; /* borrowed; daemon lifetime */
+    struct cbm_config *config;   /* borrowed; daemon lifetime */
     /* Process-wide strict serving policy. No index/update worker, watcher
      * subscription, UI mutation, or project mutation may be admitted. */
     bool read_only;

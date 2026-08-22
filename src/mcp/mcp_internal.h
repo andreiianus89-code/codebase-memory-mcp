@@ -7,18 +7,16 @@
  * safety tests. This header is internal and is not part of the MCP API. */
 typedef bool (*cbm_mcp_quarantine_test_hook_fn)(void *context, const char *step);
 typedef bool (*cbm_mcp_command_test_hook_fn)(void *context, const char *command);
-typedef bool (*cbm_mcp_trusted_source_read_test_hook_fn)(void *context,
-                                                         const char *root_path,
-                                                         const char *file_path,
-                                                         size_t max_bytes);
+typedef bool (*cbm_mcp_trusted_source_read_test_hook_fn)(void *context, const char *root_path,
+                                                         const char *file_path, size_t max_bytes);
 
 void cbm_mcp_server_set_quarantine_test_hook(cbm_mcp_server_t *srv,
                                              cbm_mcp_quarantine_test_hook_fn hook, void *context);
 void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command_test_hook_fn hook,
                                           void *context);
-void cbm_mcp_server_set_trusted_source_read_test_hook(
-    cbm_mcp_server_t *srv, cbm_mcp_trusted_source_read_test_hook_fn hook,
-    void *context);
+void cbm_mcp_server_set_trusted_source_read_test_hook(cbm_mcp_server_t *srv,
+                                                      cbm_mcp_trusted_source_read_test_hook_fn hook,
+                                                      void *context);
 
 /* Override the constructor's environment-derived policy before the server's
  * first request. Enabling read-only also disables background work. */

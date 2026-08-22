@@ -2762,8 +2762,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
             application->update_ops = *config->update_ops;
         }
     }
-    application->read_only =
-        application->read_only || cbm_env_enabled("CBM_READ_ONLY");
+    application->read_only = application->read_only || cbm_env_enabled("CBM_READ_ONLY");
     if (application->read_only) {
         application->watcher = NULL;
         application->config = NULL;

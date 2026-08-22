@@ -170,7 +170,10 @@ static void store_set_error(cbm_store_t *s, const char *msg) {
 }
 
 static void store_set_error_sqlite(cbm_store_t *s, const char *prefix) {
-    if (s && s->strict_guard_open) {
+    if (!s) {
+        return;
+    }
+    if (s->strict_guard_open) {
         s->strict_query_faulted = true;
     }
     snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(s->db));
@@ -813,9 +816,8 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         return NULL;
     }
     int rc = sqlite3_open_v2(open_path, &s->db, SQLITE_OPEN_READONLY, NULL);
-    if (rc != SQLITE_OK ||
-        sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
-            SQLITE_OK) {
+    if (rc != SQLITE_OK || sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL,
+                                        NULL) != SQLITE_OK) {
         sqlite3_close(s->db);
         free(s);
         return NULL;
@@ -901,12 +903,10 @@ static bool strict_query_guard_open(const char *path, strict_query_guard_t *guar
     if (!wide) {
         return false;
     }
-    guard->handle =
-        CreateFileW(wide, GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-                    NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    guard->handle = CreateFileW(wide, GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL,
+                                OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     free(wide);
-    return guard->handle != INVALID_HANDLE_VALUE &&
-           GetFileType(guard->handle) == FILE_TYPE_DISK &&
+    return guard->handle != INVALID_HANDLE_VALUE && GetFileType(guard->handle) == FILE_TYPE_DISK &&
            GetFileInformationByHandle(guard->handle, &guard->identity) &&
            !(guard->identity.dwFileAttributes &
              (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
@@ -964,12 +964,11 @@ static bool strict_query_guard_has_rollback_header(strict_query_guard_t *guard) 
     bool read_ok = guard && guard->fd >= 0 &&
                    pread(guard->fd, header, sizeof(header), 0) == (ssize_t)sizeof(header);
 #endif
-    return read_ok && memcmp(header, magic, sizeof(magic)) == 0 &&
-           header[18] == 1 && header[19] == 1;
+    return read_ok && memcmp(header, magic, sizeof(magic)) == 0 && header[18] == 1 &&
+           header[19] == 1;
 }
 
-static bool strict_query_guard_matches_path(const strict_query_guard_t *guard,
-                                            const char *path) {
+static bool strict_query_guard_matches_path(const strict_query_guard_t *guard, const char *path) {
     if (!guard || !path) {
         return false;
     }
@@ -978,35 +977,29 @@ static bool strict_query_guard_matches_path(const strict_query_guard_t *guard,
     if (!wide) {
         return false;
     }
-    HANDLE probe =
-        CreateFileW(wide, GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-                    NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    HANDLE probe = CreateFileW(wide, GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     free(wide);
     BY_HANDLE_FILE_INFORMATION current = {0};
     bool same =
         probe != INVALID_HANDLE_VALUE && GetFileType(probe) == FILE_TYPE_DISK &&
         GetFileInformationByHandle(probe, &current) &&
-        !(current.dwFileAttributes &
-          (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+        !(current.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
         current.dwVolumeSerialNumber == guard->identity.dwVolumeSerialNumber &&
         current.nFileIndexHigh == guard->identity.nFileIndexHigh &&
         current.nFileIndexLow == guard->identity.nFileIndexLow &&
         current.nFileSizeHigh == guard->identity.nFileSizeHigh &&
         current.nFileSizeLow == guard->identity.nFileSizeLow &&
-        current.ftLastWriteTime.dwHighDateTime ==
-            guard->identity.ftLastWriteTime.dwHighDateTime &&
-        current.ftLastWriteTime.dwLowDateTime ==
-            guard->identity.ftLastWriteTime.dwLowDateTime;
+        current.ftLastWriteTime.dwHighDateTime == guard->identity.ftLastWriteTime.dwHighDateTime &&
+        current.ftLastWriteTime.dwLowDateTime == guard->identity.ftLastWriteTime.dwLowDateTime;
     if (probe != INVALID_HANDLE_VALUE) {
         CloseHandle(probe);
     }
     return same;
 #else
     struct stat current;
-    return guard->fd >= 0 && lstat(path, &current) == 0 &&
-           S_ISREG(current.st_mode) &&
-           current.st_dev == guard->identity.st_dev &&
-           current.st_ino == guard->identity.st_ino &&
+    return guard->fd >= 0 && lstat(path, &current) == 0 && S_ISREG(current.st_mode) &&
+           current.st_dev == guard->identity.st_dev && current.st_ino == guard->identity.st_ino &&
            current.st_size == guard->identity.st_size &&
 #ifdef __APPLE__
            current.st_mtimespec.tv_sec == guard->identity.st_mtimespec.tv_sec &&
@@ -1037,13 +1030,11 @@ static bool strict_query_guard_unchanged(const strict_query_guard_t *guard) {
            current.nFileSizeLow == guard->identity.nFileSizeLow &&
            current.ftLastWriteTime.dwHighDateTime ==
                guard->identity.ftLastWriteTime.dwHighDateTime &&
-           current.ftLastWriteTime.dwLowDateTime ==
-               guard->identity.ftLastWriteTime.dwLowDateTime;
+           current.ftLastWriteTime.dwLowDateTime == guard->identity.ftLastWriteTime.dwLowDateTime;
 #else
     struct stat current;
     if (guard->fd < 0 || fstat(guard->fd, &current) != 0 ||
-        current.st_dev != guard->identity.st_dev ||
-        current.st_ino != guard->identity.st_ino ||
+        current.st_dev != guard->identity.st_dev || current.st_ino != guard->identity.st_ino ||
         current.st_size != guard->identity.st_size) {
         return false;
     }
@@ -1073,8 +1064,8 @@ static bool strict_query_core_schema_valid(cbm_store_t *store) {
     }
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
         sqlite3_stmt *statement = NULL;
-        if (sqlite3_prepare_v2(store->db, probes[i], CBM_NOT_FOUND,
-                              &statement, NULL) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(store->db, probes[i], CBM_NOT_FOUND, &statement, NULL) !=
+            SQLITE_OK) {
             sqlite3_finalize(statement);
             return false;
         }
@@ -1154,13 +1145,12 @@ cbm_store_t *cbm_store_open_path_query_strict(const char *db_path) {
     store->db_path = heap_strdup(db_path);
     store->read_only = true;
     sqlite3_set_authorizer(store->db, store_authorizer, NULL);
-    sqlite3_create_function(store->db, "regexp", ST_COL_2,
-                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_regexp, NULL, NULL);
-    sqlite3_create_function(store->db, "iregexp", ST_COL_2,
-                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_iregexp, NULL, NULL);
+    sqlite3_create_function(store->db, "regexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_regexp, NULL, NULL);
+    sqlite3_create_function(store->db, "iregexp", ST_COL_2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                            NULL, sqlite_iregexp, NULL, NULL);
     sqlite3_create_function(store->db, "cbm_cosine_i8", ST_COL_2,
-                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_cosine_i8, NULL,
-                            NULL);
+                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_cosine_i8, NULL, NULL);
     sqlite3_create_function(store->db, "cbm_camel_split", SKIP_ONE,
                             SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_camel_split, NULL,
                             NULL);
@@ -1180,8 +1170,7 @@ cbm_store_t *cbm_store_open_path_query_strict(const char *db_path) {
     }
     store->strict_guard = guard;
     store->strict_guard_open = true;
-    if (!strict_query_core_schema_valid(store) ||
-        !cbm_store_check_integrity(store) ||
+    if (!strict_query_core_schema_valid(store) || !cbm_store_check_integrity(store) ||
         !cbm_store_strict_snapshot_valid(store)) {
         cbm_store_close(store);
         return NULL;
@@ -1194,22 +1183,17 @@ static bool strict_query_sqlite_identity(cbm_store_t *s) {
     HANDLE sqlite_handle = INVALID_HANDLE_VALUE;
     BY_HANDLE_FILE_INFORMATION identity = {0};
     return s && s->db &&
-           sqlite3_file_control(s->db, "main",
-                                SQLITE_FCNTL_WIN32_GET_HANDLE,
-                                &sqlite_handle) == SQLITE_OK &&
+           sqlite3_file_control(s->db, "main", SQLITE_FCNTL_WIN32_GET_HANDLE, &sqlite_handle) ==
+               SQLITE_OK &&
            sqlite_handle != INVALID_HANDLE_VALUE &&
            GetFileInformationByHandle(sqlite_handle, &identity) &&
-           identity.dwVolumeSerialNumber ==
-               s->strict_guard.identity.dwVolumeSerialNumber &&
-           identity.nFileIndexHigh ==
-               s->strict_guard.identity.nFileIndexHigh &&
-           identity.nFileIndexLow ==
-               s->strict_guard.identity.nFileIndexLow;
+           identity.dwVolumeSerialNumber == s->strict_guard.identity.dwVolumeSerialNumber &&
+           identity.nFileIndexHigh == s->strict_guard.identity.nFileIndexHigh &&
+           identity.nFileIndexLow == s->strict_guard.identity.nFileIndexLow;
 #else
     int moved = 1;
     return s && s->db &&
-           sqlite3_file_control(s->db, "main", SQLITE_FCNTL_HAS_MOVED,
-                                &moved) == SQLITE_OK &&
+           sqlite3_file_control(s->db, "main", SQLITE_FCNTL_HAS_MOVED, &moved) == SQLITE_OK &&
            moved == 0;
 #endif
 }
@@ -1218,10 +1202,8 @@ bool cbm_store_strict_snapshot_valid(cbm_store_t *s) {
     if (!s || !s->strict_guard_open) {
         return true;
     }
-    return s->db && s->db_path &&
-           !s->strict_query_faulted &&
-           sqlite3_db_readonly(s->db, "main") == 1 &&
-           strict_query_sqlite_identity(s) &&
+    return s->db && s->db_path && !s->strict_query_faulted &&
+           sqlite3_db_readonly(s->db, "main") == 1 && strict_query_sqlite_identity(s) &&
            strict_query_guard_unchanged(&s->strict_guard) &&
            strict_query_guard_matches_path(&s->strict_guard, s->db_path) &&
            strict_query_sidecars_absent(s->db_path);
@@ -1743,8 +1725,7 @@ int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz) {
     snprintf(buf, bufsz, "legacy");
     sqlite3_stmt *stmt = NULL;
     int prepare_rc = sqlite3_prepare_v2(
-        s->db,
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_meta';",
+        s->db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_meta';",
         CBM_NOT_FOUND, &stmt, NULL);
     if (prepare_rc != SQLITE_OK) {
         if (s->strict_guard_open) {
@@ -4776,8 +4757,8 @@ void cbm_store_set_schema_allocation_failure_for_test(bool enabled) {
 }
 
 static bool schema_allocation_fails_for_test(void) {
-    return atomic_exchange_explicit(&schema_allocation_failure_for_test, 0,
-                                    memory_order_relaxed) != 0;
+    return atomic_exchange_explicit(&schema_allocation_failure_for_test, 0, memory_order_relaxed) !=
+           0;
 }
 
 static void schema_string_array_free(char **items, int count) {
@@ -5031,9 +5012,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
         int cap = ST_INIT_CAP_8;
         int n = 0;
         cbm_label_count_t *arr =
-            schema_allocation_fails_for_test()
-                ? NULL
-                : malloc(cap * sizeof(cbm_label_count_t));
+            schema_allocation_fails_for_test() ? NULL : malloc(cap * sizeof(cbm_label_count_t));
         if (!arr) {
             store_set_error_allocation(s, "schema node labels");
             sqlite3_finalize(stmt);
@@ -5093,11 +5072,11 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                                "LIMIT 50;";
 
         for (int i = 0; i < out->node_label_count; i++) {
-            if (schema_discover_props(
-                    s, prop_sql, project, out->node_labels[i].label, node_base_cols,
-                    (int)(sizeof(node_base_cols) / sizeof(node_base_cols[0])),
-                    &out->node_labels[i].properties,
-                    &out->node_labels[i].property_count) != CBM_STORE_OK) {
+            if (schema_discover_props(s, prop_sql, project, out->node_labels[i].label,
+                                      node_base_cols,
+                                      (int)(sizeof(node_base_cols) / sizeof(node_base_cols[0])),
+                                      &out->node_labels[i].properties,
+                                      &out->node_labels[i].property_count) != CBM_STORE_OK) {
                 cbm_store_schema_free(out);
                 return CBM_STORE_ERR;
             }
@@ -5181,11 +5160,10 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                                "LIMIT 50;";
 
         for (int i = 0; i < out->edge_type_count; i++) {
-            if (schema_discover_props(
-                    s, prop_sql, project, out->edge_types[i].type, edge_base_cols,
-                    (int)(sizeof(edge_base_cols) / sizeof(edge_base_cols[0])),
-                    &out->edge_types[i].properties,
-                    &out->edge_types[i].property_count) != CBM_STORE_OK) {
+            if (schema_discover_props(s, prop_sql, project, out->edge_types[i].type, edge_base_cols,
+                                      (int)(sizeof(edge_base_cols) / sizeof(edge_base_cols[0])),
+                                      &out->edge_types[i].properties,
+                                      &out->edge_types[i].property_count) != CBM_STORE_OK) {
                 cbm_store_schema_free(out);
                 return CBM_STORE_ERR;
             }
@@ -5235,9 +5213,7 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
         int cap = ST_INIT_CAP_8;
         int n = 0;
         cbm_label_count_t *arr =
-            schema_allocation_fails_for_test()
-                ? NULL
-                : malloc(cap * sizeof(cbm_label_count_t));
+            schema_allocation_fails_for_test() ? NULL : malloc(cap * sizeof(cbm_label_count_t));
         if (!arr) {
             store_set_error_allocation(s, "scoped schema node labels");
             sqlite3_finalize(stmt);
@@ -7118,8 +7094,7 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
     int *wdi;
     double *ww;
     int wn;
-    if (louvain_build_weights(nodes, n, edges, edge_count, &wsi, &wdi, &ww, &wn) !=
-        CBM_STORE_OK) {
+    if (louvain_build_weights(nodes, n, edges, edge_count, &wsi, &wdi, &ww, &wn) != CBM_STORE_OK) {
         free(result);
         return CBM_STORE_ERR;
     }
@@ -7312,8 +7287,8 @@ static void cluster_info_clear(cbm_cluster_info_t *ci) {
 
 /* Build the cluster_info for one community c into *ci. */
 static bool cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
-                              const int *degree, const char **names, const char **qns,
-                              int members, double cohesion) {
+                              const int *degree, const char **names, const char **qns, int members,
+                              double cohesion) {
     memset(ci, 0, sizeof(*ci));
     ci->id = c;
     ci->members = members;
@@ -7366,9 +7341,8 @@ static bool cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
     int pkg_counts[CBM_CLUSTER_MAX_PKGS];
     int pc = 0;
     for (int i = 0; i < n; i++) {
-        if (comm[i] == c &&
-            !cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
-                             cbm_qn_to_top_package(qns[i]))) {
+        if (comm[i] == c && !cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
+                                             cbm_qn_to_top_package(qns[i]))) {
             for (int j = 0; j < pc; j++) {
                 safe_str_free(&pkgs[j]);
             }
@@ -7588,8 +7562,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         }
         if (ne >= ecap) {
             int next_cap = ecap * ST_GROWTH;
-            cbm_louvain_edge_t *next_edges =
-                malloc((size_t)next_cap * sizeof(cbm_louvain_edge_t));
+            cbm_louvain_edge_t *next_edges = malloc((size_t)next_cap * sizeof(cbm_louvain_edge_t));
             int *next_esrc = malloc((size_t)next_cap * sizeof(int));
             int *next_edst = malloc((size_t)next_cap * sizeof(int));
             if (!next_edges || !next_esrc || !next_edst) {
@@ -7655,7 +7628,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     }
     free(res);
 
-    if (comm && C > 0) {
+    if (C > 0) {
         /* 4. Members + cohesion (internal vs boundary edges) per community. */
         int *members = calloc((size_t)C, sizeof(int));
         int *internal = calloc((size_t)C, sizeof(int));
@@ -7716,8 +7689,8 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             }
             double denom = internal[c] + boundary[c];
             double cohesion = denom > 0 ? (double)internal[c] / denom : 0.0;
-            if (!cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns,
-                                   members[c], cohesion)) {
+            if (!cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, members[c],
+                                   cohesion)) {
                 cluster_array_free(clusters, cc);
                 free(members);
                 free(internal);
