@@ -308,7 +308,7 @@ static bool artifact_directory_open(const char *repo_path, bool create,
         snprintf(directory->path, sizeof(directory->path), "%s/%s", repo_path, CBM_ARTIFACT_DIR);
     if (repo_written <= 0 || (size_t)repo_written >= sizeof(directory->repo_path) ||
         path_written <= 0 || (size_t)path_written >= sizeof(directory->path) ||
-        cbm_trusted_root_open(repo_path, &directory->repo_root) != 0) {
+        cbm_trusted_root_open_mutable_ancestors(repo_path, &directory->repo_root) != 0) {
         artifact_directory_close(directory);
         return false;
     }
@@ -324,7 +324,7 @@ static bool artifact_directory_open(const char *repo_path, bool create,
             return false;
         }
     }
-    int root_rc = cbm_trusted_root_open_mutable_children(directory->path, &directory->root);
+    int root_rc = cbm_trusted_root_open_mutable_ancestors(directory->path, &directory->root);
     if (root_rc != 0 || !artifact_directory_revalidate(directory)) {
         artifact_directory_close(directory);
         return false;
@@ -496,15 +496,29 @@ static bool artifact_lock_acquire(artifact_directory_t *directory, bool exclusiv
              : INVALID_HANDLE_VALUE;
     free(path);
     BY_HANDLE_FILE_INFORMATION identity;
-    if (!artifact_win_regular_handle(directory->lock_handle, &identity)) {
+    if (!artifact_win_regular_handle(directory->lock_handle, &identity) ||
+        !artifact_win_child_revalidate(directory, ".gitattributes", directory->lock_handle,
+                                       &identity)) {
         artifact_directory_close(directory);
         return false;
     }
+    /* Pin the validated lock child before dropping the strict artifact root.
+     * Waiting with the root open would block the current owner from renaming
+     * bundle children; the no-delete child handle keeps the root non-empty. */
+    cbm_trusted_root_close(directory->root);
+    directory->root = NULL;
     memset(&directory->lock_range, 0, sizeof(directory->lock_range));
     DWORD flags = exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0;
-    if (!LockFileEx(directory->lock_handle, flags, 0, 1, 0, &directory->lock_range) ||
+    if (!LockFileEx(directory->lock_handle, flags, 0, 1, 0, &directory->lock_range)) {
+        artifact_directory_close(directory);
+        return false;
+    }
+    directory->locked = true;
+    if (cbm_trusted_root_open_mutable_ancestors(directory->path, &directory->root) != 0 ||
         !artifact_win_child_revalidate(directory, ".gitattributes", directory->lock_handle,
-                                       &identity)) {
+                                       &identity) ||
+        (exclusive &&
+         cbm_trusted_root_upgrade_mutable_children(directory->root, directory->path) != 0)) {
         artifact_directory_close(directory);
         return false;
     }
@@ -520,8 +534,8 @@ static bool artifact_lock_acquire(artifact_directory_t *directory, bool exclusiv
         artifact_directory_close(directory);
         return false;
     }
-#endif
     directory->locked = true;
+#endif
     return true;
 }
 
@@ -740,14 +754,16 @@ static int artifact_publish_staged(artifact_directory_t *directory, artifact_sta
         return CBM_NOT_FOUND;
     }
 #ifdef _WIN32
-    wchar_t *temporary = artifact_win_child_path(directory, staged->name);
-    wchar_t *destination = artifact_win_child_path(directory, target);
-    BOOL renamed =
-        temporary && destination &&
-        MoveFileExW(temporary, destination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    char temporary[CBM_SZ_4K];
+    char destination[CBM_SZ_4K];
+    int temporary_length =
+        snprintf(temporary, sizeof(temporary), "%s/%s", directory->path, staged->name);
+    int destination_length =
+        snprintf(destination, sizeof(destination), "%s/%s", directory->path, target);
+    bool renamed = temporary_length > 0 && (size_t)temporary_length < sizeof(temporary) &&
+                   destination_length > 0 && (size_t)destination_length < sizeof(destination) &&
+                   cbm_rename_replace(temporary, destination) == 0;
     DWORD rename_error = renamed ? ERROR_SUCCESS : GetLastError();
-    free(temporary);
-    free(destination);
     if (!renamed) {
         file_error_set(out_err, "rename_temp", (int)rename_error);
         return CBM_NOT_FOUND;

@@ -136,7 +136,8 @@ static void trusted_win_close_ancestors(HANDLE *handles, size_t count) {
     free(handles);
 }
 
-static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles, size_t *out_count) {
+static bool trusted_win_pin_ancestors(wchar_t *path, DWORD share, HANDLE **out_handles,
+                                      size_t *out_count) {
     if (!path || !out_handles || !out_count) {
         return false;
     }
@@ -165,7 +166,7 @@ static bool trusted_win_pin_ancestors(wchar_t *path, HANDLE **out_handles, size_
         wchar_t saved = path[i];
         path[i] = L'\0';
         HANDLE handle = CreateFileW(
-            path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+            path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, share, NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         path[i] = saved;
         FILE_ATTRIBUTE_TAG_INFO tag = {0};
@@ -204,8 +205,7 @@ static time_t trusted_win_filetime_seconds(FILETIME value) {
     return (time_t)((ticks - unix_epoch_ticks) / UINT64_C(10000000));
 }
 
-static int trusted_win_root_open(const char *root_path, DWORD final_share,
-                                 cbm_trusted_root_t **out) {
+static int trusted_win_root_open(const char *root_path, cbm_trusted_root_t **out) {
     if (!root_path || !out) {
         return CBM_NOT_FOUND;
     }
@@ -216,12 +216,12 @@ static int trusted_win_root_open(const char *root_path, DWORD final_share,
     }
     HANDLE *ancestor_handles = NULL;
     size_t ancestor_count = 0;
-    if (!trusted_win_pin_ancestors(wide, &ancestor_handles, &ancestor_count)) {
+    if (!trusted_win_pin_ancestors(wide, FILE_SHARE_READ, &ancestor_handles, &ancestor_count)) {
         free(wide);
         return CBM_NOT_FOUND;
     }
     HANDLE handle =
-        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, final_share, NULL,
+        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL,
                     OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (handle == INVALID_HANDLE_VALUE) {
         trusted_win_close_ancestors(ancestor_handles, ancestor_count);
@@ -261,11 +261,7 @@ static int trusted_win_root_open(const char *root_path, DWORD final_share,
 }
 
 int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
-    return trusted_win_root_open(root_path, FILE_SHARE_READ, out);
-}
-
-int cbm_trusted_root_open_mutable_children(const char *root_path, cbm_trusted_root_t **out) {
-    return trusted_win_root_open(root_path, FILE_SHARE_READ | FILE_SHARE_WRITE, out);
+    return trusted_win_root_open(root_path, out);
 }
 
 void cbm_trusted_root_close(cbm_trusted_root_t *root) {
@@ -304,6 +300,61 @@ bool cbm_trusted_root_matches_path(const cbm_trusted_root_t *root, const char *p
                    trusted_win_same_identity(&root->identity, &identity);
     CloseHandle(handle);
     return matches;
+}
+
+int cbm_trusted_root_open_mutable_ancestors(const char *root_path, cbm_trusted_root_t **out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    cbm_trusted_root_t *root = NULL;
+    if (trusted_win_root_open(root_path, &root) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    HANDLE *mutable_ancestors = NULL;
+    size_t mutable_count = 0;
+    if (!trusted_win_pin_ancestors(root->lexical_path, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   &mutable_ancestors, &mutable_count) ||
+        !cbm_trusted_root_matches_path(root, root_path)) {
+        trusted_win_close_ancestors(mutable_ancestors, mutable_count);
+        cbm_trusted_root_close(root);
+        return CBM_NOT_FOUND;
+    }
+    trusted_win_close_ancestors(root->ancestor_handles, root->ancestor_count);
+    root->ancestor_handles = mutable_ancestors;
+    root->ancestor_count = mutable_count;
+    *out = root;
+    return 0;
+}
+
+int cbm_trusted_root_upgrade_mutable_children(cbm_trusted_root_t *root, const char *root_path) {
+    if (!root || !root_path || !cbm_trusted_root_matches_path(root, root_path)) {
+        return CBM_NOT_FOUND;
+    }
+    if (trusted_win_before_final_open_hook) {
+        trusted_win_before_final_open_hook(trusted_win_before_final_open_context);
+    }
+    HANDLE mutable = CreateFileW(root->lexical_path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    FILE_ATTRIBUTE_TAG_INFO tag = {0};
+    BY_HANDLE_FILE_INFORMATION identity = {0};
+    bool valid = mutable != INVALID_HANDLE_VALUE &&
+                 GetFileInformationByHandleEx(mutable, FileAttributeTagInfo, &tag, sizeof(tag)) &&
+                 !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                 (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                 GetFileInformationByHandle(mutable, &identity) &&
+                 trusted_win_same_identity(&root->identity, &identity);
+    if (!valid) {
+        if (mutable != INVALID_HANDLE_VALUE) {
+            CloseHandle(mutable);
+        }
+        return CBM_NOT_FOUND;
+    }
+    HANDLE strict = root->handle;
+    root->handle = mutable;
+    CloseHandle(strict);
+    return 0;
 }
 
 int cbm_trusted_root_dup_native_fd(const cbm_trusted_root_t *root) {
@@ -349,7 +400,8 @@ int cbm_trusted_root_read_file(const cbm_trusted_root_t *root, const char *rel_p
      * final CreateFileW resolves it. */
     HANDLE *read_ancestor_handles = NULL;
     size_t read_ancestor_count = 0;
-    if (!trusted_win_pin_ancestors(full, &read_ancestor_handles, &read_ancestor_count)) {
+    if (!trusted_win_pin_ancestors(full, FILE_SHARE_READ, &read_ancestor_handles,
+                                   &read_ancestor_count)) {
         free(full);
         return CBM_NOT_FOUND;
     }
@@ -464,8 +516,12 @@ int cbm_trusted_root_open(const char *root_path, cbm_trusted_root_t **out) {
     return 0;
 }
 
-int cbm_trusted_root_open_mutable_children(const char *root_path, cbm_trusted_root_t **out) {
+int cbm_trusted_root_open_mutable_ancestors(const char *root_path, cbm_trusted_root_t **out) {
     return cbm_trusted_root_open(root_path, out);
+}
+
+int cbm_trusted_root_upgrade_mutable_children(cbm_trusted_root_t *root, const char *root_path) {
+    return cbm_trusted_root_matches_path(root, root_path) ? 0 : CBM_NOT_FOUND;
 }
 
 void cbm_trusted_root_close(cbm_trusted_root_t *root) {

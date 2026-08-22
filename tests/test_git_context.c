@@ -139,6 +139,28 @@ static void trusted_read_replace_parent_hook(void *opaque) {
                                    parent_native, redirect_native, NULL};
     context->junction_created = cbm_exec_no_shell(junction_argv) == 0;
 }
+
+typedef struct {
+    const char *root_path;
+    int calls;
+    DWORD error;
+} trusted_upgrade_probe_t;
+
+static void trusted_upgrade_probe_hook(void *opaque) {
+    trusted_upgrade_probe_t *probe = opaque;
+    probe->calls++;
+    wchar_t *wide = cbm_path_to_wide(probe->root_path);
+    HANDLE writer =
+        wide ? CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL)
+             : INVALID_HANDLE_VALUE;
+    probe->error = writer == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    if (writer != INVALID_HANDLE_VALUE) {
+        CloseHandle(writer);
+    }
+    free(wide);
+}
 #endif
 
 /* ── canonical_root: normal repo indexed from its root ──────────── */
@@ -802,22 +824,49 @@ TEST(trusted_root_windows_mutable_children_preserves_root_identity) {
     char moved[512];
     char temp[768];
     char final[768];
+    char sibling_temp[768];
+    char sibling_final[768];
+    char guard[768];
     char *tmp = th_mktempdir("cbm_trusted_mutable_win");
     ASSERT_NOT_NULL(tmp);
     snprintf(root, sizeof(root), "%s/root", tmp);
     snprintf(moved, sizeof(moved), "%s/moved", tmp);
     snprintf(temp, sizeof(temp), "%s/temp", root);
     snprintf(final, sizeof(final), "%s/final", root);
+    snprintf(sibling_temp, sizeof(sibling_temp), "%s/sibling-temp", tmp);
+    snprintf(sibling_final, sizeof(sibling_final), "%s/sibling-final", tmp);
+    snprintf(guard, sizeof(guard), "%s/.gitattributes", root);
     ASSERT_EQ(th_mkdir_p(root), 0);
     ASSERT_EQ(th_write_file(temp, "payload"), 0);
+    ASSERT_EQ(th_write_file(sibling_temp, "sibling"), 0);
+    ASSERT_EQ(th_write_file(guard, "guard"), 0);
 
     cbm_trusted_root_t *anchor = NULL;
-    ASSERT_EQ(cbm_trusted_root_open_mutable_children(root, &anchor), 0);
+    ASSERT_EQ(cbm_trusted_root_open_mutable_ancestors(root, &anchor), 0);
     ASSERT_NOT_NULL(anchor);
+    wchar_t *wide_guard = cbm_path_to_wide(guard);
+    ASSERT_NOT_NULL(wide_guard);
+    HANDLE guard_handle =
+        CreateFileW(wide_guard, GENERIC_READ | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    ASSERT_NEQ(guard_handle, INVALID_HANDLE_VALUE);
+    trusted_upgrade_probe_t probe = {.root_path = root};
+    cbm_trusted_root_set_before_final_open_hook_for_test(trusted_upgrade_probe_hook, &probe);
+    int upgrade_result = cbm_trusted_root_upgrade_mutable_children(anchor, root);
+    cbm_trusted_root_set_before_final_open_hook_for_test(NULL, NULL);
+    ASSERT_EQ(upgrade_result, 0);
+    ASSERT_EQ(probe.calls, 1);
+    ASSERT_EQ(probe.error, ERROR_SHARING_VIOLATION);
     ASSERT_EQ(cbm_rename_replace(temp, final), 0);
+    ASSERT_EQ(cbm_rename_replace(sibling_temp, sibling_final), 0);
+    ASSERT_FALSE(DeleteFileW(wide_guard));
+    ASSERT_EQ(GetLastError(), ERROR_SHARING_VIOLATION);
     ASSERT_NEQ(cbm_rename_replace(root, moved), 0);
     ASSERT_TRUE(cbm_trusted_root_matches_path(anchor, root));
     cbm_trusted_root_close(anchor);
+    ASSERT_TRUE(CloseHandle(guard_handle));
+    free(wide_guard);
     ASSERT_EQ(cbm_rename_replace(root, moved), 0);
     th_rmtree(tmp);
     PASS();

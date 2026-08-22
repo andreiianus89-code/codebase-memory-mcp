@@ -363,7 +363,7 @@ static int trusted_git_run(const trusted_git_session_t *session,
     wchar_t *wide_command = cbm_utf8_to_wide(command_line);
     wchar_t *wide_repo = cbm_path_to_wide(session->repo_path);
     wchar_t environment[] =
-        L"GIT_CONFIG_GLOBAL=NUL\0"
+        L"GIT_CONFIG_GLOBAL=nul\0"
         L"GIT_CONFIG_NOSYSTEM=1\0"
         L"GIT_NO_LAZY_FETCH=1\0"
         L"GIT_NO_REPLACE_OBJECTS=1\0"
