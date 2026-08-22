@@ -1811,6 +1811,153 @@ static bool app_wait_for_update_notice(const cbm_daemon_runtime_application_call
     return false;
 }
 
+TEST(daemon_application_read_only_admits_no_background_or_mutation_surface) {
+    app_env_backup_t read_only_environment;
+    bool read_only_saved = app_env_backup_capture(&read_only_environment, "CBM_READ_ONLY");
+    bool read_only_unset = read_only_saved && cbm_unsetenv("CBM_READ_ONLY") == 0;
+    char root[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root), "%s/cbm-app-strict-root-XXXXXX", cbm_tmpdir());
+    bool root_ready = cbm_mkdtemp(root) != NULL;
+    app_fake_worker_context_t worker;
+    app_fake_worker_context_init(&worker);
+    app_fake_update_context_t update;
+    app_fake_update_context_init(&update, false);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &worker,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_update_ops_t update_ops = app_fake_update_ops(&update);
+    cbm_store_t *watch_store = cbm_store_open_memory();
+    cbm_watcher_t *watcher =
+        watch_store ? cbm_watcher_new(watch_store, app_test_index_noop, NULL) : NULL;
+    cbm_daemon_application_config_t config = {
+        .watcher = watcher,
+        .read_only = true,
+        .worker_ops = &worker_ops,
+        .update_ops = &update_ops,
+    };
+    cbm_daemon_application_t *application =
+        root_ready && watcher && read_only_unset ? cbm_daemon_application_new(&config) : NULL;
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 409) : NULL;
+    int background_before =
+        cbm_daemon_application_background_initializes_for_test();
+    bool initialized =
+        app_test_initialize_profile(&callbacks, session, root,
+                                    CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    int background_after =
+        cbm_daemon_application_background_initializes_for_test();
+    uint8_t *tools_list = NULL;
+    uint32_t tools_list_length = 0;
+    uint8_t *blocked_call = NULL;
+    uint32_t blocked_call_length = 0;
+    bool strict_requests_encoded =
+        initialized &&
+        app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                              "{\"jsonrpc\":\"2.0\",\"id\":4101,\"method\":\"tools/list\"}",
+                              &tools_list, &tools_list_length) &&
+        app_test_text_request(
+            CBM_DAEMON_APPLICATION_REQUEST_MCP,
+            "{\"jsonrpc\":\"2.0\",\"id\":4102,\"method\":\"tools/call\","
+            "\"params\":{\"name\":\"search_code\",\"arguments\":{}}}",
+            &blocked_call, &blocked_call_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    cbm_daemon_runtime_application_status_t tools_list_status =
+        strict_requests_encoded
+            ? app_test_request(&callbacks, session, tools_list, tools_list_length, &response,
+                               &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool strict_tools_list =
+        tools_list_status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response &&
+        strstr((const char *)response, "\"name\":\"search_graph\"") &&
+        !strstr((const char *)response, "\"name\":\"index_repository\"") &&
+        !strstr((const char *)response, "\"name\":\"search_code\"");
+    free(response);
+    response = NULL;
+    response_length = 0;
+    cbm_daemon_runtime_application_status_t blocked_call_status =
+        strict_requests_encoded
+            ? app_test_request(&callbacks, session, blocked_call, blocked_call_length, &response,
+                               &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool strict_call_rejected =
+        blocked_call_status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response &&
+        strstr((const char *)response, "tool 'search_code' is disabled") &&
+        strstr((const char *)response, "\"isError\":true");
+    int direct_index =
+        application ? cbm_daemon_application_index(application, "strict-project", root) : 0;
+    int watcher_index =
+        application ? cbm_daemon_application_watcher_index(
+                          "strict-project", root, application)
+                    : 0;
+    bool mutation =
+        application && cbm_daemon_application_project_mutation_try_begin(
+                           application, "strict-project");
+    cbm_daemon_runtime_application_status_t ui_status =
+        session ? app_test_ui_config_request(
+                      &callbacks, session,
+                      CBM_DAEMON_APPLICATION_UI_CONFIG_ENABLED, 1, 0, 7)
+                : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    size_t active_jobs =
+        application ? cbm_daemon_application_active_jobs(application) : SIZE_MAX;
+    size_t physical_limit =
+        application ? cbm_daemon_application_physical_job_limit(application) : SIZE_MAX;
+    int watch_count = watcher ? cbm_watcher_watch_count(watcher) : -1;
+
+    if (mutation) {
+        cbm_daemon_application_project_mutation_end(application, "strict-project");
+    }
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped =
+        application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    bool freed = application && cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(watch_store);
+    free(tools_list);
+    free(blocked_call);
+    free(response);
+    if (root_ready) {
+        (void)cbm_rmdir(root);
+    }
+    bool read_only_restored = app_env_backup_restore(&read_only_environment);
+
+    ASSERT_TRUE(read_only_saved);
+    ASSERT_TRUE(read_only_unset);
+    ASSERT_TRUE(root_ready);
+    ASSERT_NOT_NULL(application);
+    ASSERT_NOT_NULL(session);
+    ASSERT_TRUE(initialized);
+    ASSERT_TRUE(strict_requests_encoded);
+    ASSERT_TRUE(strict_tools_list);
+    ASSERT_TRUE(strict_call_rejected);
+    ASSERT_EQ(background_after, background_before);
+    ASSERT_EQ(atomic_load(&worker.starts), 0);
+    ASSERT_EQ(atomic_load(&update.starts), 0);
+    ASSERT_LT(direct_index, 0);
+    ASSERT_LT(watcher_index, 0);
+    ASSERT_FALSE(mutation);
+    ASSERT_EQ(ui_status, CBM_DAEMON_RUNTIME_APPLICATION_REJECTED);
+    ASSERT_EQ(active_jobs, 0);
+    ASSERT_EQ(physical_limit, 0);
+    ASSERT_EQ(watch_count, 0);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(freed);
+    ASSERT_TRUE(read_only_restored);
+    PASS();
+}
+
 /* Regression contract: initialize is the ownership boundary for daemon background
  * indexing. Only normal full MCP sessions participate; identical roots share
  * one physical worker but retain one subscription per live session. */
@@ -4877,6 +5024,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);
     RUN_TEST(daemon_application_ui_config_rejects_noncanonical_frames);
     RUN_TEST(daemon_application_restricted_profile_owns_no_background_surfaces);
+    RUN_TEST(daemon_application_read_only_admits_no_background_or_mutation_surface);
     RUN_TEST(daemon_application_hook_context_preserves_event_and_dialect);
     RUN_TEST(daemon_application_mcp_notification_has_no_response);
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);

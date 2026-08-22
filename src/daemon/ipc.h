@@ -87,6 +87,12 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener);
  * cache root as well as daemon-private artifacts. */
 bool cbm_daemon_ipc_private_directory_secure(const char *directory_path);
 
+/* Observe-only variant for strict serving. The complete path must already
+ * exist with the same owner-only mode/DACL and empty macOS extended ACL that
+ * the hardening function establishes; no mkdir, chmod, ACL, or owner repair is
+ * attempted. */
+bool cbm_daemon_ipc_private_directory_validate(const char *directory_path);
+
 /* Human-readable reason for this process's most recent private-namespace
  * validation refusal (empty string when none). Diagnostic only — callers
  * append it to their error messages; policy decisions never read it. */

@@ -304,6 +304,67 @@ TEST(daemon_hello_rejects_each_abi_mismatch) {
     PASS();
 }
 
+TEST(daemon_policy_feature_abi_separates_all_serving_policy_cohorts) {
+    const char *read_only_value = getenv("CBM_READ_ONLY");
+    const char *tracked_only_value = getenv("CBM_GIT_TRACKED_ONLY");
+    char *saved_read_only = read_only_value ? strdup(read_only_value) : NULL;
+    char *saved_tracked_only = tracked_only_value ? strdup(tracked_only_value) : NULL;
+    bool saved = (!read_only_value || saved_read_only) &&
+                 (!tracked_only_value || saved_tracked_only);
+    uint32_t cohort[4] = {0};
+
+    bool environment_ok =
+        saved && cbm_unsetenv("CBM_READ_ONLY") == 0 &&
+        cbm_unsetenv("CBM_GIT_TRACKED_ONLY") == 0;
+    if (environment_ok) {
+        cohort[0] = cbm_daemon_policy_feature_abi();
+        environment_ok = cbm_setenv("CBM_READ_ONLY", "1", 1) == 0;
+    }
+    if (environment_ok) {
+        cohort[1] = cbm_daemon_policy_feature_abi();
+        environment_ok = cbm_unsetenv("CBM_READ_ONLY") == 0 &&
+                         cbm_setenv("CBM_GIT_TRACKED_ONLY", "1", 1) == 0;
+    }
+    if (environment_ok) {
+        cohort[2] = cbm_daemon_policy_feature_abi();
+        environment_ok = cbm_setenv("CBM_READ_ONLY", "1", 1) == 0;
+    }
+    if (environment_ok) {
+        cohort[3] = cbm_daemon_policy_feature_abi();
+    }
+
+    bool restored_read_only =
+        read_only_value ? cbm_setenv("CBM_READ_ONLY", saved_read_only, 1) == 0
+                        : cbm_unsetenv("CBM_READ_ONLY") == 0;
+    bool restored_tracked_only =
+        tracked_only_value ? cbm_setenv("CBM_GIT_TRACKED_ONLY", saved_tracked_only, 1) == 0
+                           : cbm_unsetenv("CBM_GIT_TRACKED_ONLY") == 0;
+    free(saved_read_only);
+    free(saved_tracked_only);
+
+    ASSERT_TRUE(environment_ok);
+    ASSERT_TRUE(restored_read_only);
+    ASSERT_TRUE(restored_tracked_only);
+
+    cbm_daemon_conflict_t conflict;
+    for (size_t active_index = 0; active_index < 4; active_index++) {
+        cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
+        active.feature_abi = cohort[active_index];
+        ASSERT_EQ(version_test_compare(&active, &active, &conflict),
+                  CBM_DAEMON_HELLO_COMPATIBLE);
+        for (size_t requested_index = 0; requested_index < 4; requested_index++) {
+            if (requested_index == active_index) {
+                continue;
+            }
+            cbm_daemon_build_identity_t requested = active;
+            requested.feature_abi = cohort[requested_index];
+            ASSERT_EQ(version_test_compare(&active, &requested, &conflict),
+                      CBM_DAEMON_HELLO_FEATURE_ABI_CONFLICT);
+        }
+    }
+    PASS();
+}
+
 TEST(daemon_hello_fails_closed_without_an_exact_build_fingerprint) {
     cbm_daemon_build_identity_t active = version_test_identity("2.4.0", BUILD_A);
     cbm_daemon_build_identity_t missing = version_test_identity("2.4.0", NULL);
@@ -614,6 +675,7 @@ SUITE(daemon_version) {
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);
+    RUN_TEST(daemon_policy_feature_abi_separates_all_serving_policy_cohorts);
     RUN_TEST(daemon_hello_fails_closed_without_an_exact_build_fingerprint);
     RUN_TEST(daemon_conflict_log_is_durable_private_and_rotates);
 #ifndef _WIN32

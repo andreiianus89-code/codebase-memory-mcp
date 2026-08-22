@@ -9,6 +9,7 @@
 #endif
 
 #include "foundation/sha256.h"
+#include "foundation/platform.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -22,6 +23,9 @@ enum {
     DAEMON_SERVICE_IO_CAP = 64 * 1024,
     DAEMON_SERVICE_ESCAPED_VERSION_CAP = (CBM_DAEMON_VERSION_TEXT_SIZE - 1) * 6 + 1,
     DAEMON_SERVICE_LOG_RECORD_CAP = 1536,
+    DAEMON_SERVICE_FEATURE_ABI_BASE = 1U,
+    DAEMON_SERVICE_FEATURE_ABI_READ_ONLY = 1U << 8,
+    DAEMON_SERVICE_FEATURE_ABI_GIT_TRACKED_ONLY = 1U << 9,
 };
 
 static cbm_daemon_conflict_log_test_hook_fn g_conflict_log_test_hook;
@@ -37,6 +41,17 @@ static void conflict_log_test_hook(cbm_daemon_conflict_log_test_stage_t stage) {
     if (g_conflict_log_test_hook) {
         g_conflict_log_test_hook(g_conflict_log_test_context, stage);
     }
+}
+
+uint32_t cbm_daemon_policy_feature_abi(void) {
+    uint32_t feature_abi = DAEMON_SERVICE_FEATURE_ABI_BASE;
+    if (cbm_env_enabled("CBM_READ_ONLY")) {
+        feature_abi |= DAEMON_SERVICE_FEATURE_ABI_READ_ONLY;
+    }
+    if (cbm_env_enabled("CBM_GIT_TRACKED_ONLY")) {
+        feature_abi |= DAEMON_SERVICE_FEATURE_ABI_GIT_TRACKED_ONLY;
+    }
+    return feature_abi;
 }
 
 static bool bounded_length(const char *value, size_t cap, size_t *length_out) {

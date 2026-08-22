@@ -1530,6 +1530,78 @@ TEST(daemon_host_refuses_unopenable_runtime_config_database) {
     PASS();
 }
 
+TEST(daemon_host_read_only_skips_config_watcher_locks_and_http) {
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_read_only = getenv("CBM_READ_ONLY");
+    bool had_cache = old_cache != NULL;
+    bool had_read_only = old_read_only != NULL;
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char *saved_read_only = old_read_only ? cbm_strdup(old_read_only) : NULL;
+    bool snapshot_ok = (!had_cache || saved_cache) &&
+                       (!had_read_only || saved_read_only);
+
+    char parent[RUNTIME_TEST_PATH_CAP] = {0};
+    char cache[RUNTIME_TEST_PATH_CAP] = {0};
+    char config_blocker[RUNTIME_TEST_PATH_CAP] = {0};
+    char sentinel[RUNTIME_TEST_PATH_CAP] = {0};
+    char wal[RUNTIME_TEST_PATH_CAP] = {0};
+    char shm[RUNTIME_TEST_PATH_CAP] = {0};
+    bool parent_created =
+        snapshot_ok && th_secure_runtime_parent_new(parent, sizeof(parent), "host-strict");
+    int cache_written = parent_created ? snprintf(cache, sizeof(cache), "%s/cache", parent) : -1;
+    int blocker_written =
+        parent_created ? snprintf(config_blocker, sizeof(config_blocker), "%s/_config.db", cache)
+                       : -1;
+    int sentinel_written =
+        parent_created ? snprintf(sentinel, sizeof(sentinel), "%s/sentinel", config_blocker) : -1;
+    int wal_written = parent_created ? snprintf(wal, sizeof(wal), "%s-wal", config_blocker) : -1;
+    int shm_written = parent_created ? snprintf(shm, sizeof(shm), "%s-shm", config_blocker) : -1;
+    bool fixture_ready =
+        cache_written > 0 && cache_written < (int)sizeof(cache) &&
+        blocker_written > 0 && blocker_written < (int)sizeof(config_blocker) &&
+        sentinel_written > 0 && sentinel_written < (int)sizeof(sentinel) &&
+        wal_written > 0 && wal_written < (int)sizeof(wal) &&
+        shm_written > 0 && shm_written < (int)sizeof(shm) &&
+        cbm_mkdir_p(cache, 0700) && cbm_mkdir_p(config_blocker, 0700) &&
+        th_write_file(sentinel, "unchanged") == 0;
+    bool environment_ready =
+        fixture_ready && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+        cbm_setenv("CBM_READ_ONLY", "1", 1) == 0;
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        environment_ready ? cbm_daemon_ipc_endpoint_new("0123456789abcdef", parent) : NULL;
+    cbm_daemon_host_read_only_probe_result_t probe = {0};
+    bool started =
+        endpoint && cbm_daemon_host_read_only_startup_probe_for_test(endpoint, &probe);
+    bool blocker_unchanged =
+        cbm_is_dir(config_blocker) && cbm_file_size(sentinel) == 9 &&
+        !cbm_file_exists(wal) && !cbm_file_exists(shm);
+
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    runtime_test_restore_environment("CBM_CACHE_DIR", saved_cache, had_cache);
+    runtime_test_restore_environment("CBM_READ_ONLY", saved_read_only, had_read_only);
+    free(saved_cache);
+    free(saved_read_only);
+    bool cleaned = !parent_created || th_rmtree(parent) == 0;
+
+    ASSERT_TRUE(snapshot_ok);
+    ASSERT_TRUE(parent_created);
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(probe.read_only);
+    ASSERT_TRUE(probe.application_created);
+    ASSERT_FALSE(probe.runtime_config_opened);
+    ASSERT_FALSE(probe.watch_store_opened);
+    ASSERT_FALSE(probe.project_locks_created);
+    ASSERT_FALSE(probe.watcher_created);
+    ASSERT_FALSE(probe.watcher_thread_started);
+    ASSERT_FALSE(probe.http_server_created);
+    ASSERT_FALSE(probe.http_thread_started);
+    ASSERT_TRUE(blocker_unchanged);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 TEST(daemon_host_http_reconcile_rate_limits_and_retries_transient_failures) {
     const uint64_t timestamps[] = {
         0, 100, 999, 1000, 1500, 2000, 2999, 3000,
@@ -4532,6 +4604,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_stop_refuses_while_committed_clients_exist);
     RUN_TEST(daemon_host_early_coordination_failure_is_durable);
     RUN_TEST(daemon_host_refuses_unopenable_runtime_config_database);
+    RUN_TEST(daemon_host_read_only_skips_config_watcher_locks_and_http);
     RUN_TEST(daemon_host_http_reconcile_rate_limits_and_retries_transient_failures);
     RUN_TEST(daemon_host_http_retry_backoff_is_bounded);
     RUN_TEST(daemon_host_http_reconcile_retains_busy_server_until_free_succeeds);

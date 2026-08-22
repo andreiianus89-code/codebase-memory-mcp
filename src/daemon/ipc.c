@@ -690,7 +690,7 @@ static bool private_runtime_snapshot(int fd, const char *path, bool require_empt
     return valid;
 }
 
-static int private_directory_tree_open(const char *directory_path);
+static int private_directory_tree_open(const char *directory_path, bool repair);
 
 static bool private_runtime_open(const char *path, int *fd_out, dev_t *device_out,
                                  ino_t *inode_out) {
@@ -698,7 +698,7 @@ static bool private_runtime_open(const char *path, int *fd_out, dev_t *device_ou
         return false;
     }
 
-    int fd = private_directory_tree_open(path);
+    int fd = private_directory_tree_open(path, true);
     if (fd < 0) {
         return false;
     }
@@ -1404,7 +1404,7 @@ static bool posix_directory_transition_secure(int parent_fd, int child_fd) {
     return true;
 }
 
-static int private_directory_tree_open(const char *directory_path) {
+static int private_directory_tree_open(const char *directory_path, bool repair) {
     if (!directory_path || !directory_path[0] || O_DIRECTORY == 0 || O_NOFOLLOW == 0) {
         return -1;
     }
@@ -1434,9 +1434,12 @@ static int private_directory_tree_open(const char *directory_path) {
             ok = false;
         } else {
             ok = posix_directory_parent_secure(current_fd);
-            bool created = ok && mkdirat(current_fd, component, 0700) == 0;
-            if (!created && errno != EEXIST) {
-                ok = false;
+            bool created = false;
+            if (ok && repair) {
+                created = mkdirat(current_fd, component, 0700) == 0;
+                if (!created && errno != EEXIST) {
+                    ok = false;
+                }
             }
             int next_fd =
                 ok ? openat(current_fd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
@@ -1462,7 +1465,7 @@ static int private_directory_tree_open(const char *directory_path) {
             cursor++;
         }
     }
-    struct stat final_status;
+    struct stat final_status = {0};
     if (ok && !visited) {
         ipc_validation_detail_set("%s: no path components resolved", directory_path);
         ok = false;
@@ -1477,21 +1480,21 @@ static int private_directory_tree_open(const char *directory_path) {
                                   (long)final_status.st_uid, (long)geteuid());
         ok = false;
     }
-    if (ok && fchmod(current_fd, 0700) != 0) {
+    if (ok && repair && fchmod(current_fd, 0700) != 0) {
         ipc_validation_detail_set("%s: chmod 0700 failed (errno %d)", directory_path, errno);
         ok = false;
     }
-    if (ok && !cbm_macos_extended_acl_fd_clear(current_fd)) {
+    if (ok && repair && !cbm_macos_extended_acl_fd_clear(current_fd)) {
         ipc_validation_detail_set("%s: extended ACL not clearable", directory_path);
         ok = false;
     }
     if (ok && (fstat(current_fd, &final_status) != 0 || (final_status.st_mode & 07777) != 0700)) {
-        ipc_validation_detail_set("%s: mode 0%o survived chmod, expected 0700", directory_path,
+        ipc_validation_detail_set("%s: mode 0%o is not private 0700", directory_path,
                                   (unsigned)(final_status.st_mode & 07777));
         ok = false;
     }
     if (ok && !cbm_macos_extended_acl_fd_is_empty(current_fd)) {
-        ipc_validation_detail_set("%s: extended ACL still present after clear", directory_path);
+        ipc_validation_detail_set("%s: extended ACL is not empty", directory_path);
         ok = false;
     }
     free(path);
@@ -1506,10 +1509,23 @@ static int private_directory_tree_open(const char *directory_path) {
 
 bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
     ipc_validation_detail_set("%s", "");
-    int directory_fd = private_directory_tree_open(directory_path);
+    int directory_fd = private_directory_tree_open(directory_path, true);
     if (directory_fd < 0) {
         if (!ipc_validation_detail_buffer[0]) {
             ipc_validation_detail_set("%s: ancestry component validation failed (errno %d)",
+                                      directory_path, errno);
+        }
+        return false;
+    }
+    return close(directory_fd) == 0;
+}
+
+bool cbm_daemon_ipc_private_directory_validate(const char *directory_path) {
+    ipc_validation_detail_set("%s", "");
+    int directory_fd = private_directory_tree_open(directory_path, false);
+    if (directory_fd < 0) {
+        if (!ipc_validation_detail_buffer[0]) {
+            ipc_validation_detail_set("%s: private directory validation failed (errno %d)",
                                       directory_path, errno);
         }
         return false;
@@ -1541,7 +1557,7 @@ FILE *cbm_daemon_ipc_private_log_open(const char *directory_path, const char *ba
     if (!private_log_base_name_valid(base_name) || rotate_cap_bytes == 0) {
         return NULL;
     }
-    int directory_fd = private_directory_tree_open(directory_path);
+    int directory_fd = private_directory_tree_open(directory_path, true);
     if (directory_fd < 0) {
         return NULL;
     }
@@ -4108,6 +4124,30 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
     return valid_handle && owner_ok && final_private;
 }
 
+static bool win_runtime_directory_validate(const wchar_t *runtime_dir) {
+    win_security_t security;
+    if (!win_security_init(&security)) {
+        return false;
+    }
+    HANDLE directory =
+        CreateFileW(runtime_dir, FILE_READ_ATTRIBUTES | READ_CONTROL,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (directory == INVALID_HANDLE_VALUE) {
+        win_security_destroy(&security);
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    bool valid = GetFileInformationByHandle(directory, &info) != 0 &&
+                 (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                 (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+                 win_file_security_secure(&security, directory, true,
+                                          win_private_mutation_rights());
+    (void)CloseHandle(directory);
+    win_security_destroy(&security);
+    return valid;
+}
+
 static bool win_directory_component_secure(win_security_t *security, const wchar_t *path) {
     HANDLE directory =
         CreateFileW(path, FILE_READ_ATTRIBUTES | READ_CONTROL,
@@ -4130,7 +4170,7 @@ static bool win_directory_component_secure(win_security_t *security, const wchar
     return valid;
 }
 
-static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
+static bool win_private_directory_tree_secure(const wchar_t *directory_path, bool repair) {
     if (!directory_path) {
         return false;
     }
@@ -4179,7 +4219,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
             DWORD attributes = GetFileAttributesW(path);
             if (attributes == INVALID_FILE_ATTRIBUTES) {
                 DWORD error = GetLastError();
-                ok = (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
+                ok = repair && (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
                      CreateDirectoryW(path, &security.attributes) != 0;
             }
             /* Ancestors are observe-only and must already be secure.  The
@@ -4204,7 +4244,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
     }
     win_security_destroy(&security);
     if (ok) {
-        ok = win_runtime_directory_secure(path);
+        ok = repair ? win_runtime_directory_secure(path) : win_runtime_directory_validate(path);
     }
     free(path);
     return ok;
@@ -4216,7 +4256,18 @@ bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
         return false;
     }
     wchar_t *wide_directory = utf8_to_wide(directory_path);
-    bool secure = wide_directory && win_private_directory_tree_secure(wide_directory);
+    bool secure = wide_directory && win_private_directory_tree_secure(wide_directory, true);
+    free(wide_directory);
+    return secure;
+}
+
+bool cbm_daemon_ipc_private_directory_validate(const char *directory_path) {
+    ipc_validation_detail_set("%s", "");
+    if (!directory_path || !directory_path[0]) {
+        return false;
+    }
+    wchar_t *wide_directory = utf8_to_wide(directory_path);
+    bool secure = wide_directory && win_private_directory_tree_secure(wide_directory, false);
     free(wide_directory);
     return secure;
 }
@@ -4277,7 +4328,7 @@ FILE *cbm_daemon_ipc_private_log_open(const char *directory_path, const char *ba
     wchar_t *wide_path = path ? utf8_to_wide(path) : NULL;
     wchar_t *wide_rotated = rotated_path ? utf8_to_wide(rotated_path) : NULL;
     if (!wide_directory || !path || !rotated_path || !wide_path || !wide_rotated ||
-        !win_private_directory_tree_secure(wide_directory)) {
+        !win_private_directory_tree_secure(wide_directory, true)) {
         free(wide_directory);
         free(path);
         free(rotated_path);
@@ -4441,7 +4492,7 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     wchar_t *runtime_wide = utf8_to_wide(endpoint->runtime_dir);
     if (!endpoint->runtime_dir || !runtime_wide || !legacy_names_ok ||
         !endpoint->legacy_pipe_name || !endpoint->legacy_startup_mutex_name ||
-        !win_private_directory_tree_secure(runtime_wide)) {
+        !win_private_directory_tree_secure(runtime_wide, true)) {
         free(runtime_wide);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return NULL;

@@ -65,6 +65,9 @@ typedef struct {
 typedef struct {
     struct cbm_watcher *watcher;                           /* borrowed; daemon lifetime */
     struct cbm_config *config;                             /* borrowed; daemon lifetime */
+    /* Process-wide strict serving policy. No index/update worker, watcher
+     * subscription, UI mutation, or project mutation may be admitted. */
+    bool read_only;
     const cbm_daemon_application_worker_ops_t *worker_ops; /* NULL = production */
     const cbm_daemon_application_update_ops_t *update_ops; /* NULL = production */
     /* Maximum distinct, non-terminal physical index jobs. Zero selects the
