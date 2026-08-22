@@ -13,6 +13,7 @@
 #define CBM_DISCOVER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Use the existing CBMLanguage enum from extraction layer */
@@ -49,6 +50,16 @@ CBMLanguage cbm_disambiguate_cls(const char *path);
  * include (a "ROUTINE <Uppercase>" header), otherwise CBM_LANG_BITBAKE.
  * On read failure, defaults to CBM_LANG_BITBAKE. */
 CBMLanguage cbm_disambiguate_inc(const char *path);
+CBMLanguage cbm_disambiguate_m_bytes(const unsigned char *bytes, size_t len);
+CBMLanguage cbm_disambiguate_cls_bytes(const unsigned char *bytes, size_t len);
+CBMLanguage cbm_disambiguate_inc_bytes(const unsigned char *bytes, size_t len);
+
+/* Apply discovery's complete content-aware language policy to an already
+ * admitted regular-file path (ambiguous extensions, Studio Export XML, and
+ * the built-in ignored-JSON list). */
+CBMLanguage cbm_discover_detect_file_language(const char *filename, const char *path);
+CBMLanguage cbm_discover_detect_file_language_bytes(const char *filename,
+                                                    const unsigned char *bytes, size_t len);
 
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
@@ -120,6 +131,7 @@ typedef struct {
     cbm_index_mode_t mode;   /* CBM_MODE_FULL or CBM_MODE_FAST */
     const char *ignore_file; /* path to .cbmignore file, or NULL */
     int64_t max_file_size;   /* 0 = no limit */
+    bool trusted_git_only;   /* ignore mutable repo/global exclusion config */
 } cbm_discover_opts_t;
 
 typedef enum {
@@ -164,7 +176,7 @@ typedef struct {
     char *rel_path; /* heap-allocated, relative to repo root */
     char *reason;   /* heap-allocated: "gitignore" | "cbmignore" |
                      * "skip-list" | "ignored-suffix" | "fast-pattern" |
-                     * "size-cap" */
+                     * "size-cap" | "not-indexable-by-discovery" */
 } cbm_ignored_file_t;
 
 /* Stored per-file ignore entries are capped (the walk still counts ALL of

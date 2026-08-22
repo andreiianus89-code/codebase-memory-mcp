@@ -121,6 +121,11 @@ int cbm_default_worker_count(bool initial);
  * Returns NULL when the variable is unset and fallback is NULL. */
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
 
+/* Process-start policy flags accept only the documented exact values `1` and
+ * `true`. Keeping this parser shared prevents the daemon host and its MCP
+ * sessions from disagreeing about security modes. */
+bool cbm_env_enabled(const char *name);
+
 /* ── Home directory ─────────────────────────────────────────────── */
 
 /* Cross-platform home directory: tries HOME first, then USERPROFILE (Windows).

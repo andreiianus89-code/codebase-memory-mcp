@@ -32,7 +32,7 @@
 #include <sys/stat.h>
 
 /* Read an entire file into a malloc'd buffer. Returns NULL on failure. */
-static char *pkgmap_read_file(const char *path, int *out_len) {
+static char *pkgmap_read_file(cbm_pipeline_t *pipeline, const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
@@ -49,10 +49,14 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
         (void)fclose(f);
         return NULL;
     }
-    size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
+    if (!cbm_pipeline_fread_exact(pipeline, f, buf, (size_t)size)) {
+        (void)fclose(f);
+        free(buf);
+        return NULL;
+    }
     (void)fclose(f);
-    buf[nread] = '\0';
-    *out_len = (int)nread;
+    buf[size] = '\0';
+    *out_len = (int)size;
     return buf;
 }
 
@@ -849,7 +853,8 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * it hang. On Windows we additionally skip reparse points before
  * descending as a best-effort early-out. */
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth, char **excluded_dirs, int excluded_count) {
+                           int depth, char **excluded_dirs, int excluded_count,
+                           cbm_pipeline_t *pipeline) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
         return 0;
@@ -892,7 +897,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
             }
 #endif
             parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1, excluded_dirs,
-                                      excluded_count);
+                                      excluded_count, pipeline);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -901,8 +906,12 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (!is_pkgmap_manifest_basename(name)) {
             continue;
         }
+        if (pipeline && cbm_pipeline_git_tracked_only(pipeline) &&
+            !cbm_pipeline_path_is_auxiliary(pipeline, rel_path)) {
+            continue;
+        }
         int source_len = 0;
-        char *source = pkgmap_read_file(abs_path, &source_len);
+        char *source = pkgmap_read_file(pipeline, abs_path, &source_len);
         if (!source) {
             continue;
         }
@@ -928,10 +937,40 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
  * an ignored package.json) resolve on Windows as well as POSIX. */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count) {
+    return cbm_pkgmap_scan_repo_trusted(repo_path, entries, excluded_dirs, excluded_count, NULL);
+}
+
+int cbm_pkgmap_scan_repo_trusted(const char *repo_path, cbm_pkg_entries_t *entries,
+                                 char **excluded_dirs, int excluded_count,
+                                 cbm_pipeline_t *pipeline) {
     if (!repo_path || !entries) {
         return 0;
     }
-    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
+    int parsed = 0;
+    if (pipeline && cbm_pipeline_git_tracked_only(pipeline)) {
+        const cbm_file_info_t *auxiliary = NULL;
+        int auxiliary_count = 0;
+        cbm_pipeline_get_auxiliary_files(pipeline, &auxiliary, NULL, &auxiliary_count);
+        for (int i = 0; i < auxiliary_count; i++) {
+            const char *rel_path = auxiliary[i].rel_path;
+            const char *basename = path_basename(rel_path);
+            if (!is_pkgmap_manifest_basename(basename)) {
+                continue;
+            }
+            int source_len = 0;
+            char *source = pkgmap_read_file(pipeline, auxiliary[i].path, &source_len);
+            if (!source) {
+                continue;
+            }
+            if (cbm_pkgmap_try_parse(basename, rel_path, source, source_len, entries)) {
+                parsed++;
+            }
+            free(source);
+        }
+    } else {
+        parsed =
+            pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count, pipeline);
+    }
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
 }
@@ -950,7 +989,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
 
         /* Read file */
         int source_len = 0;
-        char *source = pkgmap_read_file(files[i].path, &source_len);
+        char *source = pkgmap_read_file(NULL, files[i].path, &source_len);
         if (!source) {
             continue;
         }
@@ -970,6 +1009,13 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
                                          int file_count, const char *project_name,
                                          char **excluded_dirs, int excluded_count) {
+    return cbm_pkgmap_build_from_repo_trusted(repo_path, files, file_count, project_name,
+                                              excluded_dirs, excluded_count, NULL);
+}
+
+CBMHashTable *cbm_pkgmap_build_from_repo_trusted(
+    const char *repo_path, const cbm_file_info_t *files, int file_count, const char *project_name,
+    char **excluded_dirs, int excluded_count, cbm_pipeline_t *pipeline) {
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
 
@@ -985,7 +1031,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         }
         from_files++;
         int source_len = 0;
-        char *source = pkgmap_read_file(files[i].path, &source_len);
+        char *source = pkgmap_read_file(pipeline, files[i].path, &source_len);
         if (!source) {
             continue;
         }
@@ -993,7 +1039,8 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         free(source);
     }
 
-    int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
+    int from_walk =
+        cbm_pkgmap_scan_repo_trusted(repo_path, &entries, excluded_dirs, excluded_count, pipeline);
     cbm_log_info("pkgmap.scan", "manifests_from_files", pkgmap_itoa(from_files),
                  "manifests_from_walk", pkgmap_itoa(from_walk), "entries",
                  pkgmap_itoa(entries.count));

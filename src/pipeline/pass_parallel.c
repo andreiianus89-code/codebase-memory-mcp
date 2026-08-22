@@ -216,7 +216,7 @@ static uint64_t extract_now_ns(void) {
  * *out_size receives the on-disk size and *out_status the failure reason so the
  * caller can attribute a skip to the right phase (read vs oversized) instead of
  * a silent drop. Both out params may be NULL. */
-static char *read_file(const char *path, int *out_len, long *out_size,
+static char *read_file(cbm_pipeline_t *pipeline, const char *path, int *out_len, long *out_size,
                        cbm_read_status_t *out_status) {
     if (out_size) {
         *out_size = 0;
@@ -259,10 +259,17 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         }
         return NULL;
     }
-    size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
+    if (!cbm_pipeline_fread_exact(pipeline, f, buf, (size_t)size)) {
+        (void)fclose(f);
+        free(buf);
+        if (out_status) {
+            *out_status = CBM_READ_SHORT;
+        }
+        return NULL;
+    }
     (void)fclose(f);
-    buf[nread] = '\0';
-    *out_len = (int)nread;
+    buf[size] = '\0';
+    *out_len = (int)size;
     return buf;
 }
 
@@ -274,6 +281,7 @@ typedef struct {
     cbm_file_error_t *items;
     int count;
     int cap;
+    bool recording_failed;
 } pp_err_list_t;
 
 /* NULL-safe heap strdup. */
@@ -289,25 +297,40 @@ static char *pp_err_dup(const char *s) {
     return d;
 }
 
-static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
+static bool pp_err_add(pp_err_list_t *list, const char *path, const char *reason,
                        const char *phase) {
     if (!list) {
-        return;
+        return false;
+    }
+    char *path_copy = pp_err_dup(path);
+    char *reason_copy = pp_err_dup(reason);
+    char *phase_copy = pp_err_dup(phase);
+    if (!path_copy || !reason_copy || !phase_copy) {
+        free(path_copy);
+        free(reason_copy);
+        free(phase_copy);
+        list->recording_failed = true;
+        return false;
     }
     if (list->count >= list->cap) {
         int ncap = list->cap ? list->cap * 2 : 8;
         cbm_file_error_t *grown =
             (cbm_file_error_t *)realloc(list->items, (size_t)ncap * sizeof(*grown));
         if (!grown) {
-            return; /* drop on OOM — never fail extraction to record a skip */
+            free(path_copy);
+            free(reason_copy);
+            free(phase_copy);
+            list->recording_failed = true;
+            return false;
         }
         list->items = grown;
         list->cap = ncap;
     }
-    list->items[list->count].path = pp_err_dup(path);
-    list->items[list->count].reason = pp_err_dup(reason);
-    list->items[list->count].phase = pp_err_dup(phase);
+    list->items[list->count].path = path_copy;
+    list->items[list->count].reason = reason_copy;
+    list->items[list->count].phase = phase_copy;
     list->count++;
+    return true;
 }
 
 /* Free source buffer. */
@@ -682,6 +705,7 @@ typedef struct {
     int file_count;
     const char *project_name;
     const char *repo_path;
+    cbm_pipeline_t *pipeline;
 
     extract_worker_state_t *workers;
     int max_workers;
@@ -852,7 +876,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         int source_len = 0;
         long file_size = 0;
         cbm_read_status_t rst = CBM_READ_OK;
-        char *source = read_file(fi->path, &source_len, &file_size, &rst);
+        char *source = read_file(ec->pipeline, fi->path, &source_len, &file_size, &rst);
         if (!source) {
             ws->errors++;
             if (rst == CBM_READ_OVERSIZED) {
@@ -870,7 +894,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                                  itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                                  itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
                 }
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
+            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM ||
+                       rst == CBM_READ_SHORT) {
                 pp_err_add(errs, fi->rel_path, "read failed", "read");
             }
             /* CBM_READ_EMPTY: benign 0-byte file — not reported. */
@@ -1053,7 +1078,8 @@ static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_en
      * by the main discoverer (package.json, composer.json — in
      * IGNORED_JSON_FILES) still feed pkgmap. Append into worker 0's
      * array so the existing merge below sees them. */
-    cbm_pkgmap_scan_repo(ctx->repo_path, &pkg_entries[0], ctx->excluded_dirs, ctx->excluded_count);
+    cbm_pkgmap_scan_repo_trusted(ctx->repo_path, &pkg_entries[0], ctx->excluded_dirs,
+                                 ctx->excluded_count, ctx->pipeline);
     cbm_pipeline_set_pkgmap(cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name));
     for (int i = 0; i < worker_count; i++) {
         cbm_pkg_entries_free(&pkg_entries[i]);
@@ -1073,7 +1099,8 @@ static void log_extract_mem_stats(int worker_count) {
 
 /* Forward declaration: macro table builder lives in pipeline.c (shared path). */
 CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
-                                                const char *repo_path);
+                                                const char *repo_path,
+                                                cbm_pipeline_t *pipeline);
 
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
@@ -1150,10 +1177,13 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     /* Per-worker skip lists (separate allocation; merged into the pipeline in the
      * sequential merge loop below). */
     pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
+    if (!err_lists) {
+        cbm_pipeline_mark_error_recording_failed(ctx->pipeline);
+    }
 
     /* ObjectScript macro table (NULL when no .inc include files present). */
     CBMMacroTable *pp_macro_table =
-        cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+        cbm_build_macro_table_from_files(files, file_count, ctx->repo_path, ctx->pipeline);
 
     extract_ctx_t ec = {
         .files = files,
@@ -1161,6 +1191,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .file_count = file_count,
         .project_name = ctx->project_name,
         .repo_path = ctx->repo_path,
+        .pipeline = ctx->pipeline,
         .workers = workers,
         .max_workers = worker_count,
         .result_cache = result_cache,
@@ -1206,10 +1237,13 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
      * failed still surfaces its skips. */
     if (err_lists) {
         for (int i = 0; i < worker_count; i++) {
+            if (err_lists[i].recording_failed) {
+                cbm_pipeline_mark_error_recording_failed(ctx->pipeline);
+            }
             for (int j = 0; j < err_lists[i].count; j++) {
-                cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
-                                            err_lists[i].items[j].reason,
-                                            err_lists[i].items[j].phase);
+                (void)cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
+                                                  err_lists[i].items[j].reason,
+                                                  err_lists[i].items[j].phase);
                 free(err_lists[i].items[j].path);
                 free(err_lists[i].items[j].reason);
                 free(err_lists[i].items[j].phase);
@@ -1425,6 +1459,7 @@ typedef struct {
     int file_count;
     const char *project_name;
     const char *repo_path;
+    cbm_pipeline_t *pipeline;
 
     resolve_worker_state_t *workers;
     int max_workers;
@@ -2823,7 +2858,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             if ((!lsp_source || lsp_source_len <= 0) && rc->files[file_idx].path) {
                 /* Retention cap skipped this file — re-read on demand (bounded
                  * by read_file's cbm_max_file_bytes cap), freed below. */
-                lsp_source_owned = read_file(rc->files[file_idx].path, &lsp_source_len, NULL, NULL);
+                lsp_source_owned = read_file(rc->pipeline, rc->files[file_idx].path,
+                                             &lsp_source_len, NULL, NULL);
                 lsp_source = lsp_source_owned;
             }
             if (lsp_source && lsp_source_len > 0) {
@@ -2954,6 +2990,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .file_count = file_count,
         .project_name = ctx->project_name,
         .repo_path = ctx->repo_path,
+        .pipeline = ctx->pipeline,
         .workers = workers,
         .max_workers = worker_count,
         .result_cache = result_cache,

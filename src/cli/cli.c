@@ -6595,31 +6595,7 @@ int cbm_cli_sha256_file(const char *path, char *out, size_t out_size) {
     if (out_size < SHA256_BUF_SIZE) {
         return CLI_ERR;
     }
-    FILE *fp = cbm_fopen(path, "rb");
-    if (!fp) {
-        return CLI_ERR;
-    }
-    cbm_sha256_ctx ctx;
-    cbm_sha256_init(&ctx);
-    unsigned char buf[CLI_BUF_1K];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        cbm_sha256_update(&ctx, buf, n);
-    }
-    int read_err = ferror(fp);
-    fclose(fp);
-    if (read_err) {
-        return CLI_ERR;
-    }
-    uint8_t digest[CBM_SHA256_DIGEST_LEN];
-    cbm_sha256_final(&ctx, digest);
-    static const char hex[] = "0123456789abcdef";
-    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
-        out[i * 2] = hex[digest[i] >> 4];
-        out[i * 2 + 1] = hex[digest[i] & 0x0f];
-    }
-    out[SHA256_HEX_LEN] = '\0';
-    return 0;
+    return cbm_sha256_file(path, out) == 0 ? 0 : CLI_ERR;
 }
 
 static int cli_checksum_hex_nibble(unsigned char value) {

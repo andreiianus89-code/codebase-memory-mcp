@@ -39,7 +39,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
  * on-disk size and *out_status the failure reason, so the caller can attribute
  * a skip to the right phase/reason (read vs oversized) instead of a silent
  * drop. Both out params may be NULL. */
-static char *read_file(const char *path, int *out_len, long *out_size,
+static char *read_file(cbm_pipeline_t *pipeline, const char *path, int *out_len, long *out_size,
                        cbm_read_status_t *out_status) {
     if (out_size) {
         *out_size = 0;
@@ -91,14 +91,17 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         return NULL;
     }
 
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
+    if (!cbm_pipeline_fread_exact(pipeline, f, buf, (size_t)size)) {
+        (void)fclose(f);
+        free(buf);
+        if (out_status) {
+            *out_status = CBM_READ_SHORT;
+        }
+        return NULL;
     }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
+    (void)fclose(f);
+    memset(buf + size, 0, CBM_TS_LOOKAHEAD_PAD);
+    *out_len = (int)size;
     return buf;
 }
 
@@ -546,7 +549,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         int source_len = 0;
         long file_size = 0;
         cbm_read_status_t rst = CBM_READ_OK;
-        char *source = read_file(path, &source_len, &file_size, &rst);
+        char *source = read_file(ctx->pipeline, path, &source_len, &file_size, &rst);
         if (!source) {
             errors++;
             if (rst == CBM_READ_OVERSIZED) {
@@ -561,7 +564,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 cbm_log_warn("index.file_oversized", "path", rel, "size_mb",
                              itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                              itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
-            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
+            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM ||
+                       rst == CBM_READ_SHORT) {
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
             }
             /* CBM_READ_EMPTY: benign 0-byte file — nothing to index, not reported. */

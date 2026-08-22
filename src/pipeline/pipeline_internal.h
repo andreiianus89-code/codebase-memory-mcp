@@ -13,9 +13,11 @@
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
+#include "foundation/sha256.h"
 #include "cbm.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
@@ -57,6 +59,24 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 #define CBM_US_PER_SEC 1000000LL
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_US_PER_SEC_F 1e6
+
+/* Content snapshot captured before extraction. A generation may be
+ * published only when every file still has the same SHA-256 after all
+ * parsing/resolution passes. This binds persisted digests to the bytes that
+ * produced the graph instead of merely hashing whatever happens to be on
+ * disk at persistence time. */
+typedef struct {
+    char sha256[CBM_SHA256_HEX_LEN + 1];
+    int64_t mtime_ns;
+    int64_t size;
+} cbm_file_snapshot_t;
+
+int cbm_pipeline_capture_file_snapshots(cbm_pipeline_t *p,
+                                        cbm_file_info_t *files, int file_count,
+                                        cbm_file_snapshot_t **out);
+int cbm_pipeline_verify_file_snapshots(const cbm_pipeline_t *p,
+                                       const cbm_file_info_t *files, int file_count,
+                                       cbm_file_snapshot_t *snapshots);
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
@@ -124,6 +144,17 @@ typedef struct {
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
+
+/* Sticky completeness latch: once an attempted file-error/coverage record
+ * cannot be retained, trusted indexing must abort rather than publishing an
+ * incomplete graph with falsely "complete" coverage. */
+void cbm_pipeline_mark_error_recording_failed(cbm_pipeline_t *p);
+
+/* A parser must consume exactly the size it measured. In trusted mode any
+ * short read latches a fatal input error so the staging DB cannot publish. */
+bool cbm_pipeline_fread_exact(cbm_pipeline_t *p, FILE *stream, void *buffer,
+                              size_t byte_count);
+void cbm_pipeline_set_parser_read_limit_for_tests(cbm_pipeline_t *p, size_t byte_count);
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
                                                    int excluded_count) {
@@ -193,9 +224,15 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);
+int cbm_pkgmap_scan_repo_trusted(const char *repo_path, cbm_pkg_entries_t *entries,
+                                 char **excluded_dirs, int excluded_count,
+                                 cbm_pipeline_t *pipeline);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
                                          int file_count, const char *project_name,
                                          char **excluded_dirs, int excluded_count);
+CBMHashTable *cbm_pkgmap_build_from_repo_trusted(
+    const char *repo_path, const cbm_file_info_t *files, int file_count, const char *project_name,
+    char **excluded_dirs, int excluded_count, cbm_pipeline_t *pipeline);
 CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
                                           const char *project_name);
 
@@ -641,6 +678,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
+bool cbm_pipeline_git_tracked_only(const cbm_pipeline_t *p);
+bool cbm_pipeline_path_is_tracked(const cbm_pipeline_t *p, const char *rel_path);
+bool cbm_pipeline_path_is_auxiliary(const cbm_pipeline_t *p, const char *rel_path);
+void cbm_pipeline_get_auxiliary_files(const cbm_pipeline_t *p,
+                                      const cbm_file_info_t **out_files,
+                                      const cbm_file_snapshot_t **out_snapshots, int *out_count);
+int cbm_pipeline_verify_git_snapshot(const cbm_pipeline_t *p);
+int cbm_pipeline_upsert_branch_metadata(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);
+bool cbm_pipeline_branch_metadata_changed(const cbm_pipeline_t *p, cbm_store_t *store);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
@@ -648,6 +694,10 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
 /* Test seam: invoked after a complete staging DB is sealed and immediately
  * before the cancellation check + atomic replace. Not part of the public API. */
 void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+/* Test seam after every no-op read and immediately before strict store
+ * postvalidation. A replacement injected here must invalidate the no-op. */
+void cbm_pipeline_set_before_trusted_noop_hook_for_tests(
     cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
 void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
                                             int (*hook)(const char *, const char *, void *),

@@ -67,7 +67,7 @@ static bool pxc_module_is_dir(CBMLanguage lang) {
 /* Slurp a file into a malloc'd, NUL-terminated buffer. Mirrors the
  * read_file helper in pass_calls.c / pass_parallel.c (kept local so the
  * pipeline doesn't grow a public read-file API just for this pass). */
-static char *pxc_read_file(const char *path, int *out_len) {
+static char *pxc_read_file(cbm_pipeline_t *pipeline, const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f)
         return NULL;
@@ -85,12 +85,14 @@ static char *pxc_read_file(const char *path, int *out_len) {
         (void)fclose(f);
         return NULL;
     }
-    size_t nread = fread(buf, 1, (size_t)size, f);
+    if (!cbm_pipeline_fread_exact(pipeline, f, buf, (size_t)size)) {
+        (void)fclose(f);
+        free(buf);
+        return NULL;
+    }
     (void)fclose(f);
-    if (nread > (size_t)size)
-        nread = (size_t)size;
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
+    memset(buf + size, 0, CBM_TS_LOOKAHEAD_PAD);
+    *out_len = (int)size;
     return buf;
 }
 
@@ -766,12 +768,31 @@ static bool pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *mar
                                     CBMCargoManifest *out_m) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
         return false;
+    const char *manifest_path = NULL;
+    if (ctx->pipeline && cbm_pipeline_git_tracked_only(ctx->pipeline)) {
+        const cbm_file_info_t *auxiliary = NULL;
+        int auxiliary_count = 0;
+        cbm_pipeline_get_auxiliary_files(ctx->pipeline, &auxiliary, NULL, &auxiliary_count);
+        for (int i = 0; i < auxiliary_count; i++) {
+            if (auxiliary[i].rel_path &&
+                strcmp(auxiliary[i].rel_path, "Cargo.toml") == 0) {
+                manifest_path = auxiliary[i].path;
+                break;
+            }
+        }
+        if (!manifest_path) {
+            return false;
+        }
+    }
     char path[1024];
-    int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->repo_path);
-    if (n <= 0 || (size_t)n >= sizeof(path))
-        return false;
+    if (!manifest_path) {
+        int n = snprintf(path, sizeof(path), "%s/Cargo.toml", ctx->repo_path);
+        if (n <= 0 || (size_t)n >= sizeof(path))
+            return false;
+        manifest_path = path;
+    }
     int toml_len = 0;
-    char *toml = pxc_read_file(path, &toml_len);
+    char *toml = pxc_read_file(ctx->pipeline, manifest_path, &toml_len);
     if (!toml || toml_len <= 0) {
         free(toml);
         return false;
@@ -862,7 +883,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         }
 
         int source_len = 0;
-        char *source = pxc_read_file(files[i].path, &source_len);
+        char *source = pxc_read_file(ctx->pipeline, files[i].path, &source_len);
         if (!source || source_len <= 0) {
             free(source);
             skipped_no_source++;

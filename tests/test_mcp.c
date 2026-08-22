@@ -374,6 +374,33 @@ static bool mcp_make_valid_project_store_at(const char *path, const char *projec
     return ready;
 }
 
+static bool mcp_make_sealed_project_with_node(const char *path, const char *project,
+                                              const char *root_path,
+                                              const char *node_name) {
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store) {
+        return false;
+    }
+    char qualified_name[CBM_SZ_512];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, node_name);
+    cbm_node_t node = {
+        .project = project,
+        .label = "Function",
+        .name = node_name,
+        .qualified_name = qualified_name,
+        .file_path = "main.c",
+        .start_line = 1,
+        .end_line = 1,
+        .properties_json = "{}",
+    };
+    bool ready =
+        cbm_store_upsert_project(store, project, root_path) == CBM_STORE_OK &&
+        cbm_store_upsert_node(store, &node) > 0 &&
+        cbm_store_prepare_for_publish(store) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ready;
+}
+
 static unsigned char *mcp_read_file_bytes(const char *path, long *out_len) {
     if (!out_len) {
         return NULL;
@@ -783,21 +810,18 @@ TEST(mcp_tools_have_behavior_annotations) {
         bool open_world;
     } expected[] = {
         {"index_repository", false, false, true, false},
-        /* These query tools can reach resolve_store(), whose corrupt-store
-         * recovery quarantines/removes database files. Keep the annotations
-         * conservative until query resolution is strictly non-mutating. */
-        {"search_graph", false, true, true, false},
-        {"query_graph", false, true, true, false},
-        {"trace_path", false, true, true, false},
-        {"get_code_snippet", false, true, true, false},
-        {"get_graph_schema", false, true, true, false},
-        {"get_architecture", false, true, true, false},
-        {"search_code", false, true, true, false},
+        {"search_graph", true, false, true, false},
+        {"query_graph", true, false, true, false},
+        {"trace_path", true, false, true, false},
+        {"get_code_snippet", true, false, true, false},
+        {"get_graph_schema", true, false, true, false},
+        {"get_architecture", true, false, true, false},
+        {"search_code", true, false, true, false},
         {"list_projects", true, false, true, false},
         {"delete_project", false, true, true, false},
-        {"index_status", false, true, true, false},
-        {"check_index_coverage", false, true, true, false},
-        {"detect_changes", false, true, true, false},
+        {"index_status", true, false, true, false},
+        {"check_index_coverage", true, false, true, false},
+        {"detect_changes", true, false, true, false},
         {"manage_adr", false, true, false, false},
         {"ingest_traces", false, false, false, false},
     };
@@ -1239,6 +1263,133 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static bool readonly_surface_is_enforced(void) {
+    const char *existing = getenv("CBM_READ_ONLY");
+    const char *existing_tracked = getenv("CBM_GIT_TRACKED_ONLY");
+    char *saved = existing ? strdup(existing) : NULL;
+    char *saved_tracked = existing_tracked ? strdup(existing_tracked) : NULL;
+    cbm_mcp_server_t *srv = NULL;
+    char *response = NULL;
+    bool ok = (!existing || saved) && (!existing_tracked || saved_tracked);
+    if (!ok || cbm_setenv("CBM_READ_ONLY", "1", 1) != 0 ||
+        cbm_unsetenv("CBM_GIT_TRACKED_ONLY") != 0) {
+        goto cleanup;
+    }
+    srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        goto cleanup;
+    }
+    response =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":225,\"method\":\"tools/list\"}");
+    if (!response || mcp_response_tool_count(response) != 9U ||
+        !mcp_response_has_exact_tool(response, "check_index_coverage") ||
+        mcp_response_has_exact_tool(response, "index_repository") ||
+        mcp_response_has_exact_tool(response, "delete_project") ||
+        mcp_response_has_exact_tool(response, "manage_adr") ||
+        mcp_response_has_exact_tool(response, "ingest_traces") ||
+        mcp_response_has_exact_tool(response, "search_code") ||
+        mcp_response_has_exact_tool(response, "detect_changes")) {
+        ok = false;
+        goto cleanup;
+    }
+    yyjson_doc *doc = yyjson_read(response, strlen(response), 0);
+    yyjson_val *result = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "result") : NULL;
+    yyjson_val *tools = result ? yyjson_obj_get(result, "tools") : NULL;
+    if (!tools || !yyjson_is_arr(tools)) {
+        ok = false;
+    } else {
+        size_t index, max;
+        yyjson_val *tool;
+        yyjson_arr_foreach(tools, index, max, tool) {
+            yyjson_val *annotations = yyjson_obj_get(tool, "annotations");
+            ok = ok && annotations &&
+                 yyjson_is_true(yyjson_obj_get(annotations, "readOnlyHint")) &&
+                 yyjson_is_false(yyjson_obj_get(annotations, "destructiveHint"));
+        }
+    }
+    yyjson_doc_free(doc);
+    free(response);
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2251,\"method\":\"initialize\",\"params\":{}}");
+    if (!response || !strstr(response, "sealed read-only") ||
+        !strstr(response, "canonical sealed database generation") ||
+        !strstr(response, "does not assert that the working tree is current") ||
+        !strstr(response, "stop the strict daemon") ||
+        !strstr(response, "explicit clean index in writable mode") ||
+        strstr(response, "trusted Git-tracked source snapshot") ||
+        strstr(response, "search_code") || strstr(response, "index_repository") ||
+        strstr(response, "auto-refresh")) {
+        ok = false;
+        goto cleanup;
+    }
+    free(response);
+    response = NULL;
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":226,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"delete_project\","
+             "\"arguments\":{\"project\":\"must-survive\"}}}");
+    ok = ok && response && strstr(response, "CBM_READ_ONLY=1") &&
+         strstr(response, "\"isError\":true");
+
+cleanup:
+    free(response);
+    cbm_mcp_server_free(srv);
+    if (saved) {
+        (void)cbm_setenv("CBM_READ_ONLY", saved, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_READ_ONLY");
+    }
+    free(saved);
+    if (saved_tracked) {
+        (void)cbm_setenv("CBM_GIT_TRACKED_ONLY", saved_tracked, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_TRACKED_ONLY");
+    }
+    free(saved_tracked);
+    return ok;
+}
+
+TEST(server_read_only_env_filters_and_rejects_mutators) {
+    ASSERT_TRUE(readonly_surface_is_enforced());
+    PASS();
+}
+
+TEST(server_read_only_tracked_initialize_promises_trusted_snapshot_only_for_that_cohort) {
+    const char *old_read_only = getenv("CBM_READ_ONLY");
+    const char *old_tracked = getenv("CBM_GIT_TRACKED_ONLY");
+    char *saved_read_only = old_read_only ? strdup(old_read_only) : NULL;
+    char *saved_tracked = old_tracked ? strdup(old_tracked) : NULL;
+    ASSERT_TRUE((!old_read_only || saved_read_only) && (!old_tracked || saved_tracked));
+    ASSERT_EQ(cbm_setenv("CBM_READ_ONLY", "1", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_GIT_TRACKED_ONLY", "1", 1), 0);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    char *response = cbm_mcp_server_handle(
+        server, "{\"jsonrpc\":\"2.0\",\"id\":2252,\"method\":\"initialize\",\"params\":{}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "sealed read-only"));
+    ASSERT_NOT_NULL(strstr(response, "trusted Git-tracked source snapshot"));
+    ASSERT_NOT_NULL(strstr(response, "current for the complete request"));
+    ASSERT_NULL(strstr(response, "search_code"));
+    ASSERT_NULL(strstr(response, "index_repository"));
+    ASSERT_NULL(strstr(response, "auto-refresh"));
+    free(response);
+    cbm_mcp_server_free(server);
+    if (old_read_only) {
+        (void)cbm_setenv("CBM_READ_ONLY", saved_read_only, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_READ_ONLY");
+    }
+    if (old_tracked) {
+        (void)cbm_setenv("CBM_GIT_TRACKED_ONLY", saved_tracked, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_TRACKED_ONLY");
+    }
+    free(saved_read_only);
+    free(saved_tracked);
     PASS();
 }
 
@@ -1814,6 +1965,136 @@ TEST(tool_search_graph_includes_node_properties) {
     free(inner);
     free(resp);
 
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_search_graph_json_includes_snapshot_provenance) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    static const char *const project = "test-project";
+    static const char *const branch_qn = "test-project.__branch__.main";
+    static const char *const head_sha = "0123456789abcdef0123456789abcdef01234567";
+    cbm_node_t branch = {
+        .project = project,
+        .label = "Branch",
+        .name = "main",
+        .qualified_name = branch_qn,
+        .properties_json =
+            "{\"canonical_root\":\"/tmp/test-project\","
+            "\"head_sha\":\"0123456789abcdef0123456789abcdef01234567\"}",
+    };
+    ASSERT_GT(cbm_store_upsert_node(store, &branch), 0);
+    cbm_node_t other_branch = {
+        .project = project,
+        .label = "Branch",
+        .name = "feature/newer-row",
+        .qualified_name = "test-project.__branch__.feature%2Fnewer-row",
+        .properties_json =
+            "{\"canonical_root\":\"/tmp/test-project\","
+            "\"head_sha\":\"ffffffffffffffffffffffffffffffffffffffff\"}",
+    };
+    ASSERT_GT(cbm_store_upsert_node(store, &other_branch), 0);
+    cbm_node_t project_node = {
+        .project = project,
+        .label = "Project",
+        .name = project,
+        .qualified_name = project,
+        .properties_json =
+            "{\"active_branch_qn\":\"test-project.__branch__.main\"}",
+    };
+    ASSERT_GT(cbm_store_upsert_node(store, &project_node), 0);
+
+    /* Make the second request take the ranked BM25 early-return path. */
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                             "file_path) "
+                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                             "FROM nodes;"),
+              CBM_STORE_OK);
+
+    cbm_project_t expected_project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, project, &expected_project), CBM_STORE_OK);
+    char expected_generation[96];
+    ASSERT_EQ(cbm_store_generation(store, expected_generation, sizeof(expected_generation)),
+              CBM_STORE_OK);
+
+    const char *requests[] = {
+        "{\"jsonrpc\":\"2.0\",\"id\":441,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+        "\"project\":\"test-project\",\"name_pattern\":\"HandleRequest\","
+        "\"format\":\"json\",\"limit\":5}}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":442,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+        "\"project\":\"test-project\",\"query\":\"HandleRequest\","
+        "\"format\":\"json\",\"limit\":5}}}",
+    };
+    for (int i = 0; i < 2; i++) {
+        char *response = cbm_mcp_server_handle(srv, requests[i]);
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *document = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(document);
+        yyjson_val *root = yyjson_doc_get_root(document);
+        yyjson_val *provenance = yyjson_obj_get(root, "provenance");
+        ASSERT_TRUE(yyjson_is_obj(provenance));
+        ASSERT_EQ((int)yyjson_obj_size(provenance), 5);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(provenance, "project")), project);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(provenance, "generation")),
+                      expected_generation);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(provenance, "indexed_at")),
+                      expected_project.indexed_at);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(provenance, "branch_qn")), branch_qn);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(provenance, "head_sha")), head_sha);
+        if (i == 0) {
+            ASSERT_TRUE(yyjson_is_arr(yyjson_obj_get(root, "groups")));
+        } else {
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "search_mode")), "bm25");
+            ASSERT_TRUE(yyjson_is_arr(yyjson_obj_get(root, "rows")));
+        }
+        yyjson_doc_free(document);
+        free(inner);
+        free(response);
+    }
+
+    /* Legacy fallback refuses to guess when more than one Branch exists. */
+    project_node.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(store, &project_node), 0);
+    char *response = cbm_mcp_server_handle(srv, requests[0]);
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *document = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(document);
+    yyjson_val *provenance = yyjson_obj_get(yyjson_doc_get_root(document), "provenance");
+    ASSERT_TRUE(yyjson_is_obj(provenance));
+    ASSERT_TRUE(yyjson_is_null(yyjson_obj_get(provenance, "branch_qn")));
+    ASSERT_TRUE(yyjson_is_null(yyjson_obj_get(provenance, "head_sha")));
+    yyjson_doc_free(document);
+    free(inner);
+    free(response);
+
+    /* The compact tree contract intentionally remains provenance-free. */
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":443,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"test-project\",\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(response);
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "provenance"));
+    free(inner);
+    free(response);
+
+    cbm_project_free_fields(&expected_project);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -6622,6 +6903,203 @@ TEST(snippet_source_invalid_utf8) {
     PASS();
 }
 
+typedef struct {
+    int calls;
+    size_t limits[2];
+} mcp_trusted_read_probe_t;
+
+static bool mcp_deny_trusted_source_read(void *context, const char *root_path,
+                                         const char *file_path, size_t max_bytes) {
+    mcp_trusted_read_probe_t *probe = context;
+    if (probe) {
+        if (probe->calls < (int)(sizeof(probe->limits) / sizeof(probe->limits[0]))) {
+            probe->limits[probe->calls] = max_bytes;
+        }
+        probe->calls++;
+    }
+    return !root_path || !file_path;
+}
+
+TEST(readonly_trusted_snippet_fails_closed_when_source_read_fails) {
+    const char *saved_cache_value = getenv("CBM_CACHE_DIR");
+    const char *saved_read_only_value = getenv("CBM_READ_ONLY");
+    const char *saved_tracked_value = getenv("CBM_GIT_TRACKED_ONLY");
+    char *saved_cache = saved_cache_value ? strdup(saved_cache_value) : NULL;
+    char *saved_read_only =
+        saved_read_only_value ? strdup(saved_read_only_value) : NULL;
+    char *saved_tracked = saved_tracked_value ? strdup(saved_tracked_value) : NULL;
+    bool saved = (!saved_cache_value || saved_cache) &&
+                 (!saved_read_only_value || saved_read_only) &&
+                 (!saved_tracked_value || saved_tracked);
+    char repo[CBM_SZ_1K];
+    char cache[CBM_SZ_1K];
+    snprintf(repo, sizeof(repo), "%s/cbm-strict-snippet-repo-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-strict-snippet-cache-XXXXXX", cbm_tmpdir());
+    bool directories = saved && cbm_mkdtemp(repo) && cbm_mkdtemp(cache);
+    char source_path[CBM_SZ_2K];
+    char db_path[CBM_SZ_2K];
+    snprintf(source_path, sizeof(source_path), "%s/main.c", repo);
+    snprintf(db_path, sizeof(db_path), "%s/strict-snippet.db", cache);
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const add_args[] = {"add", "main.c", NULL};
+    const char *const commit_args[] = {
+        "-c", "user.name=cbm-test", "-c", "user.email=cbm@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-q", "-m", "fixture", NULL,
+    };
+    bool repository =
+        directories &&
+        th_write_file(source_path,
+                      "int StrictSnippetProbe(void) { return 42; }\n") == 0 &&
+        mcp_test_git(repo, init_args) == 0 &&
+        mcp_test_git(repo, add_args) == 0 &&
+        mcp_test_git(repo, commit_args) == 0;
+    bool environment =
+        repository && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+        cbm_unsetenv("CBM_READ_ONLY") == 0 &&
+        cbm_setenv("CBM_GIT_TRACKED_ONLY", "1", 1) == 0;
+    cbm_pipeline_t *pipeline =
+        environment ? cbm_pipeline_new(repo, db_path, CBM_MODE_FULL) : NULL;
+    bool indexed = pipeline &&
+                   cbm_pipeline_set_project_name(pipeline, "strict-snippet") &&
+                   cbm_pipeline_run(pipeline) == 0;
+    cbm_pipeline_free(pipeline);
+
+    char qualified_name[CBM_SZ_1K] = {0};
+    cbm_store_t *store =
+        indexed ? cbm_store_open_path_query_strict(db_path) : NULL;
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    bool symbol =
+        store &&
+        cbm_store_find_nodes_by_name(store, "strict-snippet",
+                                     "StrictSnippetProbe", &nodes,
+                                     &node_count) == CBM_STORE_OK &&
+        node_count == 1 && nodes[0].qualified_name &&
+        snprintf(qualified_name, sizeof(qualified_name), "%s",
+                 nodes[0].qualified_name) > 0;
+    cbm_store_free_nodes(nodes, node_count);
+    cbm_store_close(store);
+
+    char legacy_adr_dir[CBM_SZ_2K];
+    char legacy_adr_path[CBM_SZ_2K];
+    snprintf(legacy_adr_dir, sizeof(legacy_adr_dir), "%s/.codebase-memory", repo);
+    snprintf(legacy_adr_path, sizeof(legacy_adr_path), "%s/adr.md", legacy_adr_dir);
+    bool legacy_untracked =
+        symbol && cbm_mkdir(legacy_adr_dir) == 0 &&
+        th_write_file(legacy_adr_path, "# untracked legacy ADR\n") == 0;
+    bool strict_environment =
+        legacy_untracked && cbm_setenv("CBM_READ_ONLY", "1", 1) == 0;
+    cbm_mcp_server_t *server =
+        strict_environment ? cbm_mcp_server_new("strict-snippet") : NULL;
+    char *schema_response =
+        server ? cbm_mcp_handle_tool(server, "get_graph_schema",
+                                     "{\"project\":\"strict-snippet\"}")
+               : NULL;
+    char *schema_inner = extract_text_content(schema_response);
+    bool legacy_ignored =
+        schema_response && schema_inner &&
+        !strstr(schema_response, "\"isError\":true") &&
+        strstr(schema_inner, "\"adr_present\":false") &&
+        !strstr(schema_inner, "manage_adr");
+    free(schema_inner);
+    free(schema_response);
+    bool same_bytes_rewritten =
+        th_write_file(source_path,
+                      "int StrictSnippetProbe(void) { return 42; }\n") == 0;
+    char *coverage_response =
+        server && same_bytes_rewritten
+            ? cbm_mcp_handle_tool(
+                  server, "check_index_coverage",
+                  "{\"project\":\"strict-snippet\","
+                  "\"paths\":[\"main.c\",\".codebase-memory/adr.md\"]}")
+            : NULL;
+    char *coverage_inner = extract_text_content(coverage_response);
+    bool coverage_is_content_bound =
+        coverage_response && coverage_inner &&
+        !strstr(coverage_response, "\"isError\":true") &&
+        strstr(coverage_inner, "\"path\":\"main.c\"") &&
+        strstr(coverage_inner, "\"freshness\":\"trusted_content_match\"") &&
+        strstr(coverage_inner, "\"path\":\".codebase-memory/adr.md\"") &&
+        strstr(coverage_inner, "\"freshness\":\"not_tracked\"") &&
+        !strstr(coverage_inner, "\"freshness\":\"metadata_changed\"");
+    free(coverage_inner);
+    free(coverage_response);
+    mcp_trusted_read_probe_t read_probe = {0};
+    if (server) {
+        cbm_mcp_server_set_trusted_source_read_test_hook(
+            server, mcp_deny_trusted_source_read, &read_probe);
+    }
+    char *coverage_denied =
+        server ? cbm_mcp_handle_tool(
+                     server, "check_index_coverage",
+                     "{\"project\":\"strict-snippet\",\"paths\":[\"main.c\"]}")
+               : NULL;
+    bool coverage_failed_closed =
+        coverage_denied && strstr(coverage_denied, "\"isError\":true") &&
+        strstr(coverage_denied,
+               "trusted coverage source read or hash validation failed") &&
+        !strstr(coverage_denied, "\"freshness\"");
+    free(coverage_denied);
+    char arguments[CBM_SZ_2K];
+    snprintf(arguments, sizeof(arguments),
+             "{\"project\":\"strict-snippet\",\"qualified_name\":\"%s\","
+             "\"include_neighbors\":true}",
+             qualified_name);
+    char *response =
+        server ? cbm_mcp_handle_tool(server, "get_code_snippet", arguments)
+               : NULL;
+    bool failed_closed =
+        response && strstr(response, "\"isError\":true") &&
+        strstr(response, "trusted source read or hash validation failed") &&
+        !strstr(response, "(source not available)") &&
+        !strstr(response, "\"caller_names\"") &&
+        !strstr(response, "\"callee_names\"");
+
+    free(response);
+    cbm_mcp_server_free(server);
+    if (saved_cache_value) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_read_only_value) {
+        (void)cbm_setenv("CBM_READ_ONLY", saved_read_only, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_READ_ONLY");
+    }
+    if (saved_tracked_value) {
+        (void)cbm_setenv("CBM_GIT_TRACKED_ONLY", saved_tracked, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_TRACKED_ONLY");
+    }
+    free(saved_cache);
+    free(saved_read_only);
+    free(saved_tracked);
+    bool cleaned = (!directories || th_rmtree(repo) == 0) &&
+                   (!directories || th_rmtree(cache) == 0);
+
+    ASSERT_TRUE(saved);
+    ASSERT_TRUE(directories);
+    ASSERT_TRUE(repository);
+    ASSERT_TRUE(environment);
+    ASSERT_TRUE(indexed);
+    ASSERT_TRUE(symbol);
+    ASSERT_TRUE(legacy_untracked);
+    ASSERT_TRUE(strict_environment);
+    ASSERT_NOT_NULL(server);
+    ASSERT_TRUE(legacy_ignored);
+    ASSERT_TRUE(same_bytes_rewritten);
+    ASSERT_TRUE(coverage_is_content_bound);
+    ASSERT_TRUE(coverage_failed_closed);
+    ASSERT_EQ(read_probe.calls, 2);
+    ASSERT_EQ(read_probe.limits[0],
+              strlen("int StrictSnippetProbe(void) { return 42; }\n"));
+    ASSERT_TRUE(read_probe.limits[1] > 0U);
+    ASSERT_TRUE(failed_closed);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING — EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
@@ -7623,9 +8101,9 @@ TEST(readonly_query_does_not_mutate_db) {
  *
  * readonly_query_succeeds_on_readonly_fs
  *
- * Create a real project DB (left in WAL journal mode, as the indexer
- * writes it), then chmod the CONTAINING DIRECTORY to 0555 (read-only) to
- * simulate a read-only mount / immutable media, then run search_graph.
+ * Create a sealed standalone project DB, then chmod the CONTAINING DIRECTORY
+ * to 0555 (read-only) to simulate immutable media and run search_graph with
+ * CBM_READ_ONLY=1.
  *
  * Note on why the directory (not just the file) must be read-only: SQLite's
  * unix VFS auto-downgrades a failed O_RDWR main-db open to O_RDONLY, so a
@@ -7642,12 +8120,8 @@ TEST(readonly_query_does_not_mutate_db) {
  *   configure_pragmas fails -> the open returns NULL -> resolve_store()
  *   returns NULL -> the handler emits "project not found or not indexed".
  *
- * GREEN on fixed code:
- *   the READONLY open skips the WAL write-pragma; the plain READONLY open
- *   of a WAL-mode DB in a read-only dir still needs -shm, so it fails and
- *   the immutable-URI fallback (file:..?immutable=1) reads the main DB
- *   file directly and the query returns the node. (This is the test that
- *   exercises the immutable fallback path.)
+ * GREEN on fixed code: the strict reader accepts only the standalone
+ * DELETE-journal generation and performs no write or immutable fallback.
  * ─────────────────────────────────────────────────────────────────── */
 TEST(readonly_query_succeeds_on_readonly_fs) {
     char tmp_cache[512];
@@ -7657,7 +8131,11 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
     }
     const char *saved = getenv("CBM_CACHE_DIR");
     char *saved_copy = saved ? strdup(saved) : NULL;
+    const char *saved_read_only = getenv("CBM_READ_ONLY");
+    char *saved_read_only_copy =
+        saved_read_only ? strdup(saved_read_only) : NULL;
     cbm_setenv("CBM_CACHE_DIR", tmp_cache, 1);
+    cbm_setenv("CBM_READ_ONLY", "1", 1);
 
     char db_path[700];
     snprintf(db_path, sizeof(db_path), "%s/%s.db", tmp_cache, ROQ_PROJECT);
@@ -7666,9 +8144,7 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
     snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
     snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
 
-    /* Build the DB in its natural WAL journal mode and ensure it is cleanly
-     * checkpointed (no -wal frames) so the immutable fallback can read all
-     * data from the main file. */
+    /* Publish exactly the sealed standalone form accepted by strict reads. */
     cbm_store_t *setup = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(setup);
     ASSERT_EQ(cbm_store_upsert_project(setup, ROQ_PROJECT, "/tmp/roq"), CBM_STORE_OK);
@@ -7678,8 +8154,8 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
                        .qualified_name = "roq.mod.ReadOnlyProbe",
                        .file_path = "mod.c"};
     ASSERT_TRUE(cbm_store_upsert_node(setup, &node) > 0);
-    (void)cbm_store_checkpoint(setup); /* fold WAL frames into the main file */
-    cbm_store_close(setup);            /* clean close removes -wal/-shm */
+    ASSERT_EQ(cbm_store_prepare_for_publish(setup), CBM_STORE_OK);
+    cbm_store_close(setup);
 
     /* Make the containing directory read-only (simulate a read-only mount).
      * SQLite can still traverse + read files, but cannot create -shm/-wal. */
@@ -7713,9 +8189,305 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
     } else {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
+    if (saved_read_only_copy) {
+        cbm_setenv("CBM_READ_ONLY", saved_read_only_copy, 1);
+        free(saved_read_only_copy);
+    } else {
+        cbm_unsetenv("CBM_READ_ONLY");
+    }
 
     ASSERT_FALSE(query_failed); /* RED on buggy code: WAL pragma fails on RO dir */
     ASSERT_TRUE(query_ok);      /* RED on buggy code: no node returned */
+    PASS();
+}
+
+static int mcp_deny_adr_table_reads(void *context, int action, const char *arg1,
+                                    const char *arg2, const char *database,
+                                    const char *trigger) {
+    (void)context;
+    (void)arg2;
+    (void)database;
+    (void)trigger;
+    return action == SQLITE_READ && arg1 && strcmp(arg1, "project_summaries") == 0
+               ? SQLITE_DENY
+               : SQLITE_OK;
+}
+
+TEST(readonly_schema_faults_are_discarded) {
+    char tmp_cache[512];
+    snprintf(tmp_cache, sizeof(tmp_cache), "%s/cbm_roq_schema_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_ro = getenv("CBM_READ_ONLY");
+    const char *saved_tracked = getenv("CBM_GIT_TRACKED_ONLY");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char *saved_ro_copy = saved_ro ? strdup(saved_ro) : NULL;
+    char *saved_tracked_copy = saved_tracked ? strdup(saved_tracked) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", tmp_cache, 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_READ_ONLY", "1", 1), 0);
+    ASSERT_EQ(cbm_unsetenv("CBM_GIT_TRACKED_ONLY"), 0);
+
+    const char *project = "strict-no-adr";
+    char db_path[700];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", tmp_cache, project);
+    ASSERT_TRUE(mcp_make_valid_project_store_at(db_path, project, tmp_cache));
+
+    cbm_mcp_server_t *clean_server = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(clean_server);
+    char args[256];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+    char *clean = cbm_mcp_handle_tool(clean_server, "get_graph_schema", args);
+    ASSERT_NOT_NULL(clean);
+    ASSERT_NULL(strstr(clean, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(clean, "adr_present"));
+    ASSERT_NOT_NULL(strstr(clean, "false"));
+    free(clean);
+    cbm_mcp_server_free(clean_server);
+
+    cbm_mcp_server_t *fault_server = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(fault_server);
+    cbm_store_t *fault_store = cbm_mcp_server_store(fault_server);
+    ASSERT_NOT_NULL(fault_store);
+    ASSERT_EQ(sqlite3_set_authorizer(cbm_store_get_db(fault_store),
+                                     mcp_deny_adr_table_reads, NULL),
+              SQLITE_OK);
+    char *fault = cbm_mcp_handle_tool(fault_server, "get_graph_schema", args);
+    ASSERT_NOT_NULL(fault);
+    ASSERT_NOT_NULL(strstr(fault, "\"isError\":true"));
+    ASSERT_NULL(strstr(fault, "node_labels"));
+    ASSERT_NULL(strstr(fault, "trusted_snapshot"));
+    free(fault);
+    cbm_mcp_server_free(fault_server);
+
+    const char *schema_tools[] = {"get_graph_schema", "get_architecture"};
+    const char *schema_args[] = {args,
+                                 "{\"project\":\"strict-no-adr\",\"path\":\"src\"}"};
+    const char *partial_markers[] = {"node_labels", "total_nodes"};
+    for (int i = 0; i < 2; i++) {
+        cbm_mcp_server_t *allocation_server = cbm_mcp_server_new(project);
+        ASSERT_NOT_NULL(allocation_server);
+        cbm_store_t *allocation_store = cbm_mcp_server_store(allocation_server);
+        ASSERT_NOT_NULL(allocation_store);
+        cbm_store_set_schema_allocation_failure_for_test(true);
+        cbm_schema_info_t injected_schema = {0};
+        int allocation_rc =
+            i == 0 ? cbm_store_get_schema(allocation_store, project, &injected_schema)
+                   : cbm_store_get_schema_counts_scoped(allocation_store, project, "src",
+                                                        &injected_schema);
+        cbm_store_set_schema_allocation_failure_for_test(false);
+        ASSERT_EQ(allocation_rc, CBM_STORE_ERR);
+        ASSERT_FALSE(cbm_store_strict_snapshot_valid(allocation_store));
+        cbm_store_schema_free(&injected_schema);
+
+        char *latched_fault =
+            cbm_mcp_handle_tool(allocation_server, schema_tools[i], schema_args[i]);
+        ASSERT_NOT_NULL(latched_fault);
+        ASSERT_NOT_NULL(strstr(latched_fault, "\"isError\":true"));
+        ASSERT_NULL(strstr(latched_fault, partial_markers[i]));
+        free(latched_fault);
+        cbm_mcp_server_free(allocation_server);
+
+        cbm_mcp_server_t *handler_server = cbm_mcp_server_new(NULL);
+        ASSERT_NOT_NULL(handler_server);
+        cbm_store_t *handler_store = cbm_mcp_server_store(handler_server);
+        ASSERT_NOT_NULL(handler_store);
+        ASSERT_EQ(cbm_store_upsert_project(handler_store, project, tmp_cache), CBM_STORE_OK);
+        cbm_mcp_server_set_project(handler_server, project);
+        cbm_store_set_schema_allocation_failure_for_test(true);
+        char *handler_fault =
+            cbm_mcp_handle_tool(handler_server, schema_tools[i], schema_args[i]);
+        cbm_store_set_schema_allocation_failure_for_test(false);
+        ASSERT_NOT_NULL(handler_fault);
+        ASSERT_NOT_NULL(strstr(handler_fault, "\"isError\":true"));
+        ASSERT_NULL(strstr(handler_fault, partial_markers[i]));
+        free(handler_fault);
+        cbm_mcp_server_free(handler_server);
+    }
+
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_ro_copy) {
+        cbm_setenv("CBM_READ_ONLY", saved_ro_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_READ_ONLY");
+    }
+    if (saved_tracked_copy) {
+        cbm_setenv("CBM_GIT_TRACKED_ONLY", saved_tracked_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_GIT_TRACKED_ONLY");
+    }
+    free(saved_cache_copy);
+    free(saved_ro_copy);
+    free(saved_tracked_copy);
+    th_rmtree(tmp_cache);
+    PASS();
+}
+
+TEST(readonly_canonical_failure_never_falls_back_to_alias) {
+    char tmp_cache[512];
+    snprintf(tmp_cache, sizeof(tmp_cache), "%s/cbm_roq_alias_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_ro = getenv("CBM_READ_ONLY");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char *saved_ro_copy = saved_ro ? strdup(saved_ro) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", tmp_cache, 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_READ_ONLY", "1", 1), 0);
+
+    const char *project = "strict-canonical";
+    char canonical[700];
+    char alias[700];
+    snprintf(canonical, sizeof(canonical), "%s/%s.db", tmp_cache, project);
+    snprintf(alias, sizeof(alias), "%s/stale-alias.db", tmp_cache);
+    ASSERT_EQ(th_write_file(canonical, "malformed canonical generation"), 0);
+    ASSERT_TRUE(mcp_make_valid_project_store_at(alias, project, tmp_cache));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(srv);
+    char args[256];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*\"}", project);
+    char *response = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NULL(strstr(response, "trusted_snapshot"));
+    free(response);
+    cbm_mcp_server_free(srv);
+
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_ro_copy) {
+        cbm_setenv("CBM_READ_ONLY", saved_ro_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_READ_ONLY");
+    }
+    free(saved_cache_copy);
+    free(saved_ro_copy);
+    th_rmtree(tmp_cache);
+    PASS();
+}
+
+TEST(readonly_allowed_root_hides_other_cached_projects_and_error_names) {
+    const char *saved_cache_value = getenv("CBM_CACHE_DIR");
+    const char *saved_read_only_value = getenv("CBM_READ_ONLY");
+    const char *saved_tracked_value = getenv("CBM_GIT_TRACKED_ONLY");
+    char *saved_cache = saved_cache_value ? strdup(saved_cache_value) : NULL;
+    char *saved_read_only =
+        saved_read_only_value ? strdup(saved_read_only_value) : NULL;
+    char *saved_tracked = saved_tracked_value ? strdup(saved_tracked_value) : NULL;
+
+    char *tmp = th_mktempdir("cbm_strict_boundary");
+    ASSERT_NOT_NULL(tmp);
+    char base[CBM_SZ_1K];
+    snprintf(base, sizeof(base), "%s", tmp);
+    char cache[CBM_SZ_2K];
+    char root_a[CBM_SZ_2K];
+    char root_b[CBM_SZ_2K];
+    char db_a[CBM_SZ_2K];
+    char db_b[CBM_SZ_2K];
+    snprintf(cache, sizeof(cache), "%s/cache", base);
+    snprintf(root_a, sizeof(root_a), "%s/repo-a", base);
+    snprintf(root_b, sizeof(root_b), "%s/repo-b", base);
+    snprintf(db_a, sizeof(db_a), "%s/allowed-project.db", cache);
+    snprintf(db_b, sizeof(db_b), "%s/outside-secret-project.db", cache);
+    ASSERT_EQ(cbm_mkdir(cache), 0);
+    ASSERT_EQ(cbm_mkdir(root_a), 0);
+    ASSERT_EQ(cbm_mkdir(root_b), 0);
+    ASSERT_TRUE(mcp_make_sealed_project_with_node(
+        db_a, "allowed-project", root_a, "AllowedSymbol"));
+    ASSERT_TRUE(mcp_make_sealed_project_with_node(
+        db_b, "outside-secret-project", root_b, "OutsideSecretSymbol"));
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_READ_ONLY", "1", 1), 0);
+    ASSERT_EQ(cbm_unsetenv("CBM_GIT_TRACKED_ONLY"), 0);
+
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(server, root_a, root_a));
+
+    char *projects = cbm_mcp_handle_tool(server, "list_projects", "{}");
+    ASSERT_NOT_NULL(projects);
+    ASSERT_NOT_NULL(strstr(projects, "allowed-project"));
+    ASSERT_NULL(strstr(projects, "outside-secret-project"));
+    ASSERT_NULL(strstr(projects, "OutsideSecretSymbol"));
+    ASSERT_NULL(strstr(projects, "root_path"));
+    ASSERT_NULL(strstr(projects, "\"nodes\""));
+    ASSERT_NULL(strstr(projects, "\"edges\""));
+    ASSERT_NOT_NULL(strstr(projects, "discovery_only"));
+    free(projects);
+
+    char *outside = cbm_mcp_handle_tool(
+        server, "search_graph",
+        "{\"project\":\"outside-secret-project\","
+        "\"name_pattern\":\"OutsideSecretSymbol\"}");
+    ASSERT_NOT_NULL(outside);
+    ASSERT_NOT_NULL(strstr(outside, "\"isError\":true"));
+    ASSERT_NULL(strstr(outside, "outside-secret-project"));
+    ASSERT_NULL(strstr(outside, "OutsideSecretSymbol"));
+    free(outside);
+
+    char *typo = cbm_mcp_handle_tool(
+        server, "search_graph",
+        "{\"project\":\"missing-project\",\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(typo);
+    ASSERT_NOT_NULL(strstr(typo, "\"isError\":true"));
+    ASSERT_NULL(strstr(typo, "outside-secret-project"));
+    ASSERT_NULL(strstr(typo, "OutsideSecretSymbol"));
+    free(typo);
+
+    char *suffix = cbm_mcp_handle_tool(
+        server, "search_graph",
+        "{\"project\":\"secret-project\",\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(suffix);
+    ASSERT_NOT_NULL(strstr(suffix, "\"isError\":true"));
+    ASSERT_NULL(strstr(suffix, "outside-secret-project"));
+    ASSERT_NULL(strstr(suffix, "OutsideSecretSymbol"));
+    free(suffix);
+
+    char path_arguments[CBM_SZ_4K];
+    snprintf(path_arguments, sizeof(path_arguments),
+             "{\"project\":\"%s\",\"name_pattern\":\".*\"}", root_b);
+    char *path_probe =
+        cbm_mcp_handle_tool(server, "search_graph", path_arguments);
+    ASSERT_NOT_NULL(path_probe);
+    ASSERT_NOT_NULL(strstr(path_probe, "\"isError\":true"));
+    ASSERT_NULL(strstr(path_probe, "outside-secret-project"));
+    ASSERT_NULL(strstr(path_probe, "OutsideSecretSymbol"));
+    free(path_probe);
+
+    char *allowed = cbm_mcp_handle_tool(
+        server, "search_graph",
+        "{\"project\":\"allowed-project\",\"name_pattern\":\"AllowedSymbol\"}");
+    ASSERT_NOT_NULL(allowed);
+    ASSERT_NULL(strstr(allowed, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(allowed, "AllowedSymbol"));
+    free(allowed);
+    cbm_mcp_server_free(server);
+
+    if (saved_cache_value) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_read_only_value) {
+        (void)cbm_setenv("CBM_READ_ONLY", saved_read_only, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_READ_ONLY");
+    }
+    if (saved_tracked_value) {
+        (void)cbm_setenv("CBM_GIT_TRACKED_ONLY", saved_tracked, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_TRACKED_ONLY");
+    }
+    free(saved_cache);
+    free(saved_read_only);
+    free(saved_tracked);
+    ASSERT_EQ(th_rmtree(base), 0);
     PASS();
 }
 
@@ -9556,6 +10328,8 @@ SUITE(mcp) {
     RUN_TEST(server_handle_tools_list);
     RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
     RUN_TEST(server_handle_analysis_profile_filters_and_rejects_mutators);
+    RUN_TEST(server_read_only_env_filters_and_rejects_mutators);
+    RUN_TEST(server_read_only_tracked_initialize_promises_trusted_snapshot_only_for_that_cohort);
     RUN_TEST(server_handle_scout_profile_exposes_only_the_fast_tier);
     RUN_TEST(analysis_profile_arguments_fail_closed_and_disable_http);
     RUN_TEST(hook_windows_path_containment_is_case_insensitive_and_segment_safe);
@@ -9579,6 +10353,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_search_graph_json_includes_snapshot_provenance);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_lean_defaults_schema_and_status);
     RUN_TEST(tool_output_regression_gate);
@@ -9660,6 +10435,9 @@ SUITE(mcp) {
     /* Query store read-only (data integrity) */
     RUN_TEST(readonly_query_does_not_mutate_db);
     RUN_TEST(readonly_query_succeeds_on_readonly_fs);
+    RUN_TEST(readonly_schema_faults_are_discarded);
+    RUN_TEST(readonly_canonical_failure_never_falls_back_to_alias);
+    RUN_TEST(readonly_allowed_root_hides_other_cached_projects_and_error_names);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);
@@ -9700,6 +10478,7 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
+    RUN_TEST(readonly_trusted_snippet_fails_closed_when_source_read_fails);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);

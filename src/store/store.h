@@ -224,6 +224,20 @@ cbm_store_t *cbm_store_open_path_existing(const char *db_path);
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
+/* Strict read-only open for trusted query serving. Accepts only a sealed,
+ * standalone DELETE-journal generation with no WAL/SHM/journal sidecar. It
+ * never falls back to SQLite immutable mode (which can bypass live journals). */
+cbm_store_t *cbm_store_open_path_query_strict(const char *db_path);
+
+/* Revalidate the exact main-file generation admitted by a strict query open.
+ * Non-strict/in-memory stores return true. */
+bool cbm_store_strict_snapshot_valid(cbm_store_t *s);
+
+/* Latch a query failure discovered by a caller that uses the raw SQLite
+ * handle. A strict request remains invalid even if later successful SQLite
+ * calls overwrite sqlite3_errcode(). No-op for ordinary stores. */
+void cbm_store_mark_query_fault(cbm_store_t *s, const char *context);
+
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);
@@ -244,6 +258,9 @@ void cbm_store_close(cbm_store_t *s);
 
 /* Get the underlying sqlite3 handle (for testing only). */
 struct sqlite3 *cbm_store_get_db(cbm_store_t *s);
+
+/* Test-only one-shot fault injection for schema result allocation. */
+void cbm_store_set_schema_allocation_failure_for_test(bool enabled);
 
 /* Get the last error message (static string, valid until next call). */
 const char *cbm_store_error(cbm_store_t *s);

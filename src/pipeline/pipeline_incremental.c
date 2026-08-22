@@ -89,7 +89,7 @@ static const char *incr_mode_name(int mode) {
  * Caller must free the returned array. */
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
                             int stored_count, int *out_changed, int *out_unchanged) {
-    bool *changed = calloc((size_t)file_count, sizeof(bool));
+    bool *changed = calloc((size_t)(file_count > 0 ? file_count : 1), sizeof(bool));
     if (!changed) {
         return NULL;
     }
@@ -100,8 +100,17 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
     /* Build lookup: rel_path -> stored hash */
     CBMHashTable *ht =
         cbm_ht_create(stored_count > 0 ? (size_t)stored_count * PAIR_LEN : CBM_SZ_64);
+    if (!ht) {
+        free(changed);
+        return NULL;
+    }
     for (int i = 0; i < stored_count; i++) {
         cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
+        if (cbm_ht_get(ht, stored[i].rel_path) != &stored[i]) {
+            cbm_ht_free(ht);
+            free(changed);
+            return NULL;
+        }
     }
 
     for (int i = 0; i < file_count; i++) {
@@ -176,6 +185,67 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
  * deleted should be classified as deleted from the indexer's perspective
  * because the indexer follows symlinks during discovery — a stale symlink
  * has no source to parse. */
+static void free_deleted_files(char **deleted, int count) {
+    if (!deleted) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(deleted[i]);
+    }
+    free(deleted);
+}
+
+static bool append_deleted_file(char ***deleted, int *count, int *capacity,
+                                const char *rel_path) {
+    if (*count >= *capacity) {
+        int next_capacity = *capacity * PAIR_LEN;
+        char **grown = realloc(*deleted, (size_t)next_capacity * sizeof(**deleted));
+        if (!grown) {
+            return false;
+        }
+        *deleted = grown;
+        *capacity = next_capacity;
+    }
+    char *copy = strdup(rel_path);
+    if (!copy) {
+        return false;
+    }
+    (*deleted)[(*count)++] = copy;
+    return true;
+}
+
+static bool append_mode_skipped_file(cbm_file_hash_t **mode_skipped, int *count, int *capacity,
+                                     const cbm_file_hash_t *stored) {
+    if (*count >= *capacity) {
+        int next_capacity = *capacity * PAIR_LEN;
+        cbm_file_hash_t *grown =
+            realloc(*mode_skipped, (size_t)next_capacity * sizeof(**mode_skipped));
+        if (!grown) {
+            return false;
+        }
+        *mode_skipped = grown;
+        *capacity = next_capacity;
+    }
+    char *rel_path = strdup(stored->rel_path);
+    char *sha256 = stored->sha256 ? strdup(stored->sha256) : NULL;
+    if (!rel_path || (stored->sha256 && !sha256)) {
+        free(rel_path);
+        free(sha256);
+        return false;
+    }
+    (*mode_skipped)[*count] = (cbm_file_hash_t){
+        .project = NULL,
+        .rel_path = rel_path,
+        .sha256 = sha256,
+        .mtime_ns = stored->mtime_ns,
+        .size = stored->size,
+    };
+    (*count)++;
+    return true;
+}
+
+static void free_mode_skipped(cbm_file_hash_t *ms, int count);
+
 static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int file_count,
                               cbm_file_hash_t *stored, int stored_count, char ***out_deleted,
                               cbm_file_hash_t **out_mode_skipped, int *out_mode_skipped_count) {
@@ -188,12 +258,20 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
          * silently re-introducing the destructive overwrite this function
          * was rewritten to prevent. */
         cbm_log_error("incremental.err", "msg", "find_deleted_files_null_repo_path");
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
     CBMHashTable *current = cbm_ht_create((size_t)file_count * PAIR_LEN);
+    if (!current) {
+        return CBM_NOT_FOUND;
+    }
     for (int i = 0; i < file_count; i++) {
         cbm_ht_set(current, files[i].rel_path, &files[i]);
+        if (cbm_ht_get(current, files[i].rel_path) != &files[i]) {
+            cbm_log_error("incremental.err", "msg", "find_deleted_files_hash_insert_failed");
+            cbm_ht_free(current);
+            return CBM_NOT_FOUND;
+        }
     }
 
     int del_count = 0;
@@ -202,7 +280,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
     if (!deleted) {
         cbm_log_error("incremental.err", "msg", "find_deleted_files_oom");
         cbm_ht_free(current);
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
     int ms_count = 0;
@@ -212,7 +290,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         cbm_log_error("incremental.err", "msg", "find_deleted_files_oom_ms");
         free(deleted);
         cbm_ht_free(current);
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
     for (int i = 0; i < stored_count; i++) {
@@ -245,48 +323,20 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
         if (preserve) {
             /* Carry forward the existing hash row so subsequent reindexes
              * can correctly classify this file. */
-            if (ms_count >= ms_cap) {
-                ms_cap *= PAIR_LEN;
-                cbm_file_hash_t *tmp = realloc(mode_skipped, (size_t)ms_cap * sizeof(*tmp));
-                if (!tmp) {
-                    cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom_ms");
-                    break;
-                }
-                mode_skipped = tmp;
-            }
-            char *rp = strdup(stored[i].rel_path);
-            char *sh = stored[i].sha256 ? strdup(stored[i].sha256) : NULL;
-            if (!rp || (stored[i].sha256 && !sh)) {
-                /* OOM mid-record. Drop this entry rather than persist a
-                 * row with a NULL rel_path that would silently fail the
-                 * NOT NULL constraint in upsert and reintroduce the
-                 * orphaned-node bug. */
+            if (!append_mode_skipped_file(&mode_skipped, &ms_count, &ms_cap, &stored[i])) {
                 cbm_log_error("incremental.err", "msg", "find_deleted_files_strdup_oom", "rel_path",
                               stored[i].rel_path);
-                free(rp);
-                free(sh);
-                break;
+                goto fail;
             }
-            mode_skipped[ms_count].project = NULL; /* unused by upsert API */
-            mode_skipped[ms_count].rel_path = rp;
-            mode_skipped[ms_count].sha256 = sh;
-            mode_skipped[ms_count].mtime_ns = stored[i].mtime_ns;
-            mode_skipped[ms_count].size = stored[i].size;
-            ms_count++;
             continue;
         }
 
         /* File is truly gone — record for purge. */
-        if (del_count >= del_cap) {
-            del_cap *= PAIR_LEN;
-            char **tmp = realloc(deleted, (size_t)del_cap * sizeof(char *));
-            if (!tmp) {
-                cbm_log_error("incremental.err", "msg", "find_deleted_files_realloc_oom");
-                break;
-            }
-            deleted = tmp;
+        if (!append_deleted_file(&deleted, &del_count, &del_cap, stored[i].rel_path)) {
+            cbm_log_error("incremental.err", "msg", "find_deleted_files_append_failed",
+                          "rel_path", stored[i].rel_path);
+            goto fail;
         }
-        deleted[del_count++] = strdup(stored[i].rel_path);
     }
 
     cbm_ht_free(current);
@@ -294,6 +344,12 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
     *out_mode_skipped = mode_skipped;
     *out_mode_skipped_count = ms_count;
     return del_count;
+
+fail:
+    cbm_ht_free(current);
+    free_deleted_files(deleted, del_count);
+    free_mode_skipped(mode_skipped, ms_count);
+    return CBM_NOT_FOUND;
 }
 
 /* Free a mode_skipped array allocated by find_deleted_files. */
@@ -451,9 +507,9 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
  * Every row is attempted so logs identify all failures, but any failed
  * upsert rejects the staging generation. Atomic publication makes preserving
  * the complete previous generation safer than installing partial metadata. */
-static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
-                          int file_count, const cbm_file_hash_t *mode_skipped,
-                          int mode_skipped_count) {
+static int persist_hashes(cbm_store_t *store, const char *project,
+                          cbm_file_info_t *files, int file_count,
+                          const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
     int current_failed = 0;
     int ms_failed = 0;
 
@@ -637,8 +693,8 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                            cbm_file_info_t *files, int file_count,
+static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path,
+                            const char *project, cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                             const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template) {
@@ -708,6 +764,10 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count) {
+    if (cbm_pipeline_git_tracked_only(p)) {
+        cbm_log_error("incremental.err", "msg", "trusted_mode_requires_clean_full");
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -730,6 +790,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int n_unchanged = 0;
     bool *is_changed =
         classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
+    if (!is_changed) {
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
 
     /* Classify stored files absent from current discovery: truly-deleted
      * (purge) vs mode-skipped (preserve nodes AND hash rows). */
@@ -739,6 +804,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int deleted_count =
         find_deleted_files(cbm_pipeline_repo_path(p), files, file_count, stored, stored_count,
                            &deleted, &mode_skipped, &mode_skipped_count);
+    if (deleted_count < 0) {
+        free(is_changed);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
                  itoa_buf(n_unchanged), "deleted", itoa_buf(deleted_count), "mode_skipped",
@@ -747,7 +818,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Fast path: nothing changed → skip. The on-disk DB is left untouched,
      * which means existing hash rows (including for any mode-skipped files
      * that were already preserved by an earlier run) remain intact. */
-    if (n_changed == 0 && deleted_count == 0) {
+    bool branch_metadata_changed = cbm_pipeline_branch_metadata_changed(p, store);
+    if (n_changed == 0 && deleted_count == 0 && !branch_metadata_changed) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
         free(is_changed);
         free(deleted);
@@ -815,6 +887,20 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
 
+    if (cbm_pipeline_upsert_branch_metadata(p, existing) != 0) {
+        cbm_log_error("incremental.err", "msg", "branch_metadata_refresh_failed");
+        cbm_gbuf_free(existing);
+        free(changed_files);
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+
     cbm_store_close(store);
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
@@ -863,8 +949,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
 
-    cbm_path_alias_collection_t *path_aliases =
-        cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
+    cbm_path_alias_collection_t *path_aliases = cbm_load_path_aliases_trusted(
+        cbm_pipeline_repo_path(p), excluded_dirs, excluded_count, p);
 
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -1006,8 +1092,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = 1,
     };
-    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                                      mode_skipped_count, cov, cov_n, &coverage_meta);
+    int persist_rc =
+        dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+                         mode_skipped_count, cov, cov_n, &coverage_meta);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);

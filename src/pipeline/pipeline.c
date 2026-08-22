@@ -23,6 +23,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "git/git_context.h"
 #include "store/store.h"
 #include "macro_table.h"
+#include "lsp/scope.h"
 #include "arena.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
@@ -35,7 +36,21 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/sha256.h"
+#include "foundation/trusted_fs.h"
+#include "foundation/limits.h"
+#include "mcp/index_supervisor.h"
+#include "semantic/semantic.h"
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
+#include <sqlite3.h>
+#include <yyjson/yyjson.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -73,6 +88,67 @@ void cbm_pipeline_unlock(void) {
     atomic_store(&g_pipeline_busy, 0);
 }
 
+static bool pipeline_recipe_fingerprint(char out[CBM_SHA256_HEX_LEN + 1]) {
+    if (!out) {
+        return false;
+    }
+    if (!cbm_index_supervisor_build_fingerprint() &&
+        !cbm_index_supervisor_capture_build_fingerprint()) {
+        return false;
+    }
+    const char *build = cbm_index_supervisor_build_fingerprint();
+    char disabled_lsp[CBM_SZ_16];
+    bool lsp_cross =
+        cbm_safe_getenv("CBM_DISABLE_LSP_CROSS", disabled_lsp, sizeof(disabled_lsp), NULL) == NULL;
+    cbm_sem_config_t semantic = cbm_sem_get_config();
+    static const char *const graph_env_names[] = {
+        "CBM_WALK_DEFS_MAX",
+        "CBM_TS_TYPE_BUDGET",
+        "CBM_LSP_DISABLED",
+        "CBM_LSP_MAX_WALK_DEPTH",
+        "CBM_INDEX_SINGLE_THREAD",
+    };
+    char env_hashes[sizeof(graph_env_names) / sizeof(graph_env_names[0])]
+                   [CBM_SHA256_HEX_LEN + 1];
+    for (size_t i = 0;
+         i < sizeof(graph_env_names) / sizeof(graph_env_names[0]); i++) {
+        const char *value = getenv(graph_env_names[i]);
+        cbm_sha256_ctx env_hash;
+        uint8_t digest[CBM_SHA256_DIGEST_LEN];
+        cbm_sha256_init(&env_hash);
+        const unsigned char present = value ? 1u : 0u;
+        cbm_sha256_update(&env_hash, &present, sizeof(present));
+        if (value) {
+            cbm_sha256_update(&env_hash, value, strlen(value));
+        }
+        cbm_sha256_final(&env_hash, digest);
+        static const char hex[] = "0123456789abcdef";
+        for (size_t j = 0; j < sizeof(digest); j++) {
+            env_hashes[i][j * 2] = hex[digest[j] >> 4];
+            env_hashes[i][j * 2 + 1] = hex[digest[j] & 0x0f];
+        }
+        env_hashes[i][CBM_SHA256_HEX_LEN] = '\0';
+    }
+    int lsp_walk_depth = cbm_lsp_configure_max_walk_depth();
+    char recipe[CBM_SZ_1K];
+    int n = snprintf(recipe, sizeof(recipe),
+                     "trusted-recipe-v2;build=%s;mode=full;tracked=1;"
+                     "lsp_cross=%d;semantic=%d;semantic_threshold=%.9g;"
+                     "max_file_bytes=%ld;auxiliary_manifest=v1;githistory=0;"
+                     "walk_defs_env=%s;ts_type_budget_env=%s;lsp_disabled_env=%s;"
+                     "lsp_walk_depth_env=%s;lsp_walk_depth=%d;single_thread_env=%s",
+                     build ? build : "", lsp_cross ? 1 : 0,
+                     cbm_sem_is_enabled() ? 1 : 0, (double)semantic.threshold,
+                     cbm_max_file_bytes(), env_hashes[0], env_hashes[1],
+                     env_hashes[2], env_hashes[3], lsp_walk_depth,
+                     env_hashes[4]);
+    if (!build || n < 0 || (size_t)n >= sizeof(recipe)) {
+        return false;
+    }
+    cbm_sha256_hex(recipe, (size_t)n, out);
+    return true;
+}
+
 /* ── Internal state ──────────────────────────────────────────────── */
 
 struct cbm_pipeline {
@@ -82,6 +158,30 @@ struct cbm_pipeline {
     cbm_git_context_t git_ctx;
     char *branch_qn;
     cbm_index_mode_t mode;
+    bool git_tracked_only;
+    char recipe_sha256[CBM_SHA256_HEX_LEN + 1];
+    cbm_trusted_root_t *trusted_root;
+    char *trusted_snapshot_dir;
+    unsigned int trusted_snapshot_serial;
+    bool trusted_validation_only;
+#ifdef _WIN32
+    HANDLE trusted_snapshot_dir_handle;
+    BY_HANDLE_FILE_INFORMATION trusted_snapshot_dir_identity;
+#else
+    int trusted_snapshot_dir_fd;
+    dev_t trusted_snapshot_dir_device;
+    ino_t trusted_snapshot_dir_inode;
+#endif
+    char **tracked_paths;
+    int tracked_path_count;
+    cbm_file_info_t *auxiliary_files;
+    cbm_file_snapshot_t *auxiliary_snapshots;
+    int auxiliary_file_count;
+    /* Source corpus retained until the atomic publication boundary so the
+     * final hook-to-rename window is covered by the same digest contract. */
+    cbm_file_info_t *publish_files;
+    cbm_file_snapshot_t *publish_snapshots;
+    int publish_file_count;
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
@@ -111,6 +211,9 @@ struct cbm_pipeline {
     cbm_file_error_t *file_errors;
     int file_errors_count;
     int file_errors_cap;
+    bool error_recording_failed;
+    atomic_int parser_read_failed;
+    size_t parser_read_limit_for_tests;
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
@@ -127,9 +230,18 @@ struct cbm_pipeline {
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
     void *before_publish_hook_ctx;
+    void (*before_trusted_noop_hook)(cbm_pipeline_t *, const char *, void *);
+    void *before_trusted_noop_hook_ctx;
     int (*rename_hook)(const char *, const char *, void *);
     void *rename_hook_ctx;
 };
+
+static bool pipeline_recipe_unchanged(const cbm_pipeline_t *p) {
+    char current[CBM_SHA256_HEX_LEN + 1];
+    return p && p->recipe_sha256[0] &&
+           pipeline_recipe_fingerprint(current) &&
+           strcmp(current, p->recipe_sha256) == 0;
+}
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
 
@@ -182,17 +294,43 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     if (!p) {
         return NULL;
     }
+#ifdef _WIN32
+    p->trusted_snapshot_dir_handle = INVALID_HANDLE_VALUE;
+#else
+    p->trusted_snapshot_dir_fd = -1;
+#endif
 
+    char tracked_only_buf[CBM_SZ_16];
+    const char *tracked_only =
+        cbm_safe_getenv("CBM_GIT_TRACKED_ONLY", tracked_only_buf, sizeof(tracked_only_buf), "");
+    p->git_tracked_only =
+        tracked_only && (strcmp(tracked_only, "1") == 0 || strcmp(tracked_only, "true") == 0);
     p->repo_path = strdup(repo_path);
     p->db_path = db_path ? strdup(db_path) : NULL;
     p->project_name = cbm_project_name_from_path(repo_path);
-    (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
-    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
+    if (p->git_tracked_only) {
+        /* Trusted snapshots have one semantic shape. Callers may still pass
+         * FAST/MODERATE for compatibility, but the effective run is FULL. */
+        p->mode = CBM_MODE_FULL;
+        (void)pipeline_recipe_fingerprint(p->recipe_sha256);
+        if (cbm_trusted_root_open(repo_path, &p->trusted_root) != 0) {
+            cbm_pipeline_free(p);
+            return NULL;
+        }
+        if (cbm_git_context_resolve_trusted(repo_path, p->trusted_root, &p->git_ctx) != 0) {
+            cbm_pipeline_free(p);
+            return NULL;
+        }
+    } else {
+        (void)cbm_git_context_resolve(repo_path, &p->git_ctx);
+    }
+    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->persistence = false;
     p->committed_nodes = -1;
     p->committed_edges = -1;
     atomic_init(&p->cancelled_storage, 0);
+    atomic_init(&p->parser_read_failed, 0);
     p->cancelled = &p->cancelled_storage;
 
     return p;
@@ -225,6 +363,17 @@ bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     return true;
 }
 
+static void clear_publish_snapshot(cbm_pipeline_t *p) {
+    if (!p) {
+        return;
+    }
+    cbm_discover_free(p->publish_files, p->publish_file_count);
+    p->publish_files = NULL;
+    free(p->publish_snapshots);
+    p->publish_snapshots = NULL;
+    p->publish_file_count = 0;
+}
+
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -232,6 +381,15 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p->repo_path);
     free(p->db_path);
     free(p->project_name);
+    cbm_git_free_tracked_files(p->tracked_paths, p->tracked_path_count);
+    p->tracked_paths = NULL;
+    p->tracked_path_count = 0;
+    cbm_discover_free(p->auxiliary_files, p->auxiliary_file_count);
+    p->auxiliary_files = NULL;
+    free(p->auxiliary_snapshots);
+    p->auxiliary_snapshots = NULL;
+    p->auxiliary_file_count = 0;
+    clear_publish_snapshot(p);
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
@@ -253,6 +411,66 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
                          * restore in dump_and_persist_hashes runs. Issue #516. */
     p->saved_adr = NULL;
     cbm_git_context_free(&p->git_ctx);
+    cbm_trusted_root_close(p->trusted_root);
+    p->trusted_root = NULL;
+    if (p->trusted_snapshot_dir) {
+#ifdef _WIN32
+        wchar_t *wide_dir = cbm_path_to_wide(p->trusted_snapshot_dir);
+        DWORD dir_attributes =
+            wide_dir ? GetFileAttributesW(wide_dir) : INVALID_FILE_ATTRIBUTES;
+        if (dir_attributes != INVALID_FILE_ATTRIBUTES) {
+            (void)SetFileAttributesW(wide_dir,
+                                     dir_attributes & ~FILE_ATTRIBUTE_READONLY);
+        }
+        free(wide_dir);
+#else
+        (void)chmod(p->trusted_snapshot_dir, 0700);
+#endif
+        cbm_dir_t *dir = cbm_opendir(p->trusted_snapshot_dir);
+        cbm_dirent_t *entry;
+        while (dir && (entry = cbm_readdir(dir)) != NULL) {
+            if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0) {
+                continue;
+            }
+            size_t dir_len = strlen(p->trusted_snapshot_dir);
+            size_t name_len = strlen(entry->name);
+            if (dir_len <= SIZE_MAX - name_len - PAIR_LEN) {
+                char *path = (char *)malloc(dir_len + name_len + PAIR_LEN);
+                if (path) {
+                    snprintf(path, dir_len + name_len + PAIR_LEN, "%s/%s",
+                             p->trusted_snapshot_dir, entry->name);
+#ifdef _WIN32
+                    wchar_t *wide_path = cbm_path_to_wide(path);
+                    if (wide_path) {
+                        (void)SetFileAttributesW(wide_path, FILE_ATTRIBUTE_NORMAL);
+                        free(wide_path);
+                    }
+#else
+                    (void)chmod(path, 0600);
+#endif
+                    (void)cbm_unlink(path);
+                    free(path);
+                }
+            }
+        }
+        if (dir) {
+            cbm_closedir(dir);
+        }
+#ifdef _WIN32
+        if (p->trusted_snapshot_dir_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(p->trusted_snapshot_dir_handle);
+            p->trusted_snapshot_dir_handle = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (p->trusted_snapshot_dir_fd >= 0) {
+            close(p->trusted_snapshot_dir_fd);
+            p->trusted_snapshot_dir_fd = -1;
+        }
+#endif
+        (void)cbm_rmdir(p->trusted_snapshot_dir);
+        free(p->trusted_snapshot_dir);
+        p->trusted_snapshot_dir = NULL;
+    }
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
     if (p->userconfig) {
@@ -283,6 +501,14 @@ void cbm_pipeline_set_before_publish_hook_for_tests(
     }
 }
 
+void cbm_pipeline_set_before_trusted_noop_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx) {
+    if (p) {
+        p->before_trusted_noop_hook = hook;
+        p->before_trusted_noop_hook_ctx = ctx;
+    }
+}
+
 void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
                                             int (*hook)(const char *, const char *, void *),
                                             void *ctx) {
@@ -298,6 +524,66 @@ const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
 
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
     return p ? p->repo_path : NULL;
+}
+
+bool cbm_pipeline_git_tracked_only(const cbm_pipeline_t *p) {
+    return p && p->git_tracked_only;
+}
+
+bool cbm_pipeline_path_is_tracked(const cbm_pipeline_t *p, const char *rel_path) {
+    if (!p || !rel_path || !p->tracked_paths || p->tracked_path_count <= 0) {
+        return false;
+    }
+    int lo = 0;
+    int hi = p->tracked_path_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(rel_path, p->tracked_paths[mid]);
+        if (cmp == 0) {
+            return true;
+        }
+        if (cmp < 0) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return false;
+}
+
+bool cbm_pipeline_path_is_auxiliary(const cbm_pipeline_t *p, const char *rel_path) {
+    if (!p || !rel_path || !p->auxiliary_files || p->auxiliary_file_count <= 0) {
+        return false;
+    }
+    int lo = 0;
+    int hi = p->auxiliary_file_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        int cmp = strcmp(rel_path, p->auxiliary_files[mid].rel_path);
+        if (cmp == 0) {
+            return true;
+        }
+        if (cmp < 0) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return false;
+}
+
+void cbm_pipeline_get_auxiliary_files(const cbm_pipeline_t *p,
+                                      const cbm_file_info_t **out_files,
+                                      const cbm_file_snapshot_t **out_snapshots, int *out_count) {
+    if (out_files) {
+        *out_files = p ? p->auxiliary_files : NULL;
+    }
+    if (out_snapshots) {
+        *out_snapshots = p ? p->auxiliary_snapshots : NULL;
+    }
+    if (out_count) {
+        *out_count = p ? p->auxiliary_file_count : 0;
+    }
 }
 
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
@@ -330,27 +616,72 @@ static char *fe_strdup(const char *s) {
     return d;
 }
 
-void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+void cbm_pipeline_mark_error_recording_failed(cbm_pipeline_t *p) {
+    if (p) {
+        p->error_recording_failed = true;
+    }
+}
+
+bool cbm_pipeline_fread_exact(cbm_pipeline_t *p, FILE *stream, void *buffer,
+                              size_t byte_count) {
+    if (!stream || (!buffer && byte_count > 0)) {
+        return false;
+    }
+    size_t requested = byte_count;
+    if (p && p->parser_read_limit_for_tests > 0 &&
+        requested > p->parser_read_limit_for_tests) {
+        requested = p->parser_read_limit_for_tests;
+    }
+    if (fread(buffer, 1, requested, stream) == byte_count) {
+        return true;
+    }
+    if (p && p->git_tracked_only) {
+        atomic_store_explicit(&p->parser_read_failed, 1, memory_order_relaxed);
+    }
+    return false;
+}
+
+void cbm_pipeline_set_parser_read_limit_for_tests(cbm_pipeline_t *p, size_t byte_count) {
+    if (p) {
+        p->parser_read_limit_for_tests = byte_count;
+    }
+}
+
+bool cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
                                  const char *phase) {
     if (!p) {
-        return;
+        return false;
+    }
+    char *path_copy = fe_strdup(path);
+    char *reason_copy = fe_strdup(reason);
+    char *phase_copy = fe_strdup(phase);
+    if (!path_copy || !reason_copy || !phase_copy) {
+        free(path_copy);
+        free(reason_copy);
+        free(phase_copy);
+        cbm_pipeline_mark_error_recording_failed(p);
+        return false;
     }
     if (p->file_errors_count >= p->file_errors_cap) {
         int ncap = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
         cbm_file_error_t *grown =
             (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown));
         if (!grown) {
-            /* Never abort indexing just to record a skip — drop this record. */
-            return;
+            free(path_copy);
+            free(reason_copy);
+            free(phase_copy);
+            cbm_pipeline_mark_error_recording_failed(p);
+            return false;
         }
         p->file_errors = grown;
         p->file_errors_cap = ncap;
     }
     cbm_file_error_t *e = &p->file_errors[p->file_errors_count];
-    e->path = fe_strdup(path);
-    e->reason = fe_strdup(reason);
-    e->phase = fe_strdup(phase);
+    e->path = path_copy;
+    e->reason = reason_copy;
+    e->phase = phase_copy;
     p->file_errors_count++;
+    return true;
 }
 
 void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count) {
@@ -389,6 +720,442 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
         p->committed_nodes = nodes;
         p->committed_edges = edges;
     }
+}
+
+static int refresh_git_context(cbm_pipeline_t *p) {
+    cbm_git_context_t refreshed = {0};
+    int resolve_rc =
+        p && p->git_tracked_only
+            ? cbm_git_context_resolve_trusted(p->repo_path, p->trusted_root, &refreshed)
+            : cbm_git_context_resolve(p->repo_path, &refreshed);
+    if (resolve_rc != 0) {
+        return CBM_NOT_FOUND;
+    }
+    char *branch_qn = cbm_git_context_branch_qn(p->project_name, &refreshed);
+    if (!branch_qn) {
+        cbm_git_context_free(&refreshed);
+        return CBM_NOT_FOUND;
+    }
+    cbm_git_context_free(&p->git_ctx);
+    p->git_ctx = refreshed;
+    free(p->branch_qn);
+    p->branch_qn = branch_qn;
+    return 0;
+}
+
+static bool nullable_string_equal(const char *lhs, const char *rhs) {
+    return (!lhs && !rhs) || (lhs && rhs && strcmp(lhs, rhs) == 0);
+}
+
+int cbm_pipeline_verify_git_snapshot(const cbm_pipeline_t *p) {
+    if (!p || !p->git_tracked_only || !p->git_ctx.is_git || !p->branch_qn) {
+        return p && !p->git_tracked_only ? 0 : CBM_NOT_FOUND;
+    }
+    cbm_git_context_t current = {0};
+    char *current_branch_qn = NULL;
+    char **current_paths = NULL;
+    int current_count = 0;
+    bool matches =
+        p->trusted_root &&
+        cbm_trusted_root_matches_path(p->trusted_root, p->repo_path) &&
+        cbm_git_context_resolve_trusted(p->repo_path, p->trusted_root, &current) == 0 &&
+        current.is_git;
+    if (matches) {
+        current_branch_qn = cbm_git_context_branch_qn(p->project_name, &current);
+        matches = current_branch_qn &&
+                  nullable_string_equal(current_branch_qn, p->branch_qn) &&
+                  nullable_string_equal(current.branch, p->git_ctx.branch) &&
+                  current.is_git == p->git_ctx.is_git &&
+                  current.is_worktree == p->git_ctx.is_worktree &&
+                  current.is_detached == p->git_ctx.is_detached &&
+                  current.root_exists == p->git_ctx.root_exists &&
+                  nullable_string_equal(current.head_sha, p->git_ctx.head_sha) &&
+                  nullable_string_equal(current.base_sha, p->git_ctx.base_sha) &&
+                  nullable_string_equal(current.worktree_root,
+                                        p->git_ctx.worktree_root) &&
+                  nullable_string_equal(current.git_common_dir,
+                                        p->git_ctx.git_common_dir) &&
+                  nullable_string_equal(current.canonical_root, p->git_ctx.canonical_root) &&
+                  cbm_git_list_tracked_files_trusted(p->repo_path, p->trusted_root,
+                                                     &current_paths, &current_count) == 0 &&
+                  current_count == p->tracked_path_count;
+    }
+    for (int i = 0; matches && i < current_count; i++) {
+        matches = strcmp(current_paths[i], p->tracked_paths[i]) == 0;
+    }
+    cbm_git_free_tracked_files(current_paths, current_count);
+    free(current_branch_qn);
+    cbm_git_context_free(&current);
+    if (!matches) {
+        cbm_log_error("pipeline.snapshot", "status", "git_state_changed_during_index");
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+static bool project_active_branch_matches(const cbm_pipeline_t *p, cbm_store_t *store) {
+    if (!p || !store || !p->branch_qn) {
+        return false;
+    }
+    cbm_node_t project = {0};
+    if (cbm_store_find_node_by_qn(store, p->project_name, p->project_name, &project) !=
+        CBM_STORE_OK) {
+        return false;
+    }
+    yyjson_doc *doc =
+        project.properties_json
+            ? yyjson_read(project.properties_json, strlen(project.properties_json), 0)
+            : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *active = root && yyjson_is_obj(root)
+                             ? yyjson_obj_get(root, "active_branch_qn")
+                             : NULL;
+    bool matches = active && yyjson_is_str(active) &&
+                   strcmp(yyjson_get_str(active), p->branch_qn) == 0;
+    if (matches && p->git_tracked_only) {
+        yyjson_val *recipe = yyjson_obj_get(root, "index_recipe_sha256");
+        matches = p->recipe_sha256[0] && recipe && yyjson_is_str(recipe) &&
+                  strcmp(yyjson_get_str(recipe), p->recipe_sha256) == 0;
+    }
+    yyjson_doc_free(doc);
+    cbm_node_free_fields(&project);
+    return matches;
+}
+
+int cbm_pipeline_upsert_branch_metadata(cbm_pipeline_t *p, cbm_gbuf_t *gbuf) {
+    if (!p || !gbuf || !p->branch_qn) {
+        return CBM_NOT_FOUND;
+    }
+    const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+    char *branch_props = cbm_git_context_props_json_alloc(&p->git_ctx);
+    if (!branch_props || (p->git_tracked_only && !p->recipe_sha256[0])) {
+        free(branch_props);
+        return CBM_NOT_FOUND;
+    }
+    yyjson_mut_doc *project_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *project_obj = project_doc ? yyjson_mut_obj(project_doc) : NULL;
+    if (!project_doc || !project_obj) {
+        yyjson_mut_doc_free(project_doc);
+        free(branch_props);
+        return CBM_NOT_FOUND;
+    }
+    yyjson_mut_doc_set_root(project_doc, project_obj);
+    yyjson_mut_obj_add_strcpy(project_doc, project_obj, "active_branch_qn", p->branch_qn);
+    if (p->git_tracked_only) {
+        yyjson_mut_obj_add_strcpy(project_doc, project_obj, "index_recipe_sha256",
+                                  p->recipe_sha256);
+    }
+    char *project_props = yyjson_mut_write(project_doc, 0, NULL);
+    yyjson_mut_doc_free(project_doc);
+    if (!project_props ||
+        cbm_gbuf_upsert_node(gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0,
+                             project_props) <= 0) {
+        free(project_props);
+        free(branch_props);
+        return CBM_NOT_FOUND;
+    }
+    free(project_props);
+    bool branch_existed = cbm_gbuf_find_by_qn(gbuf, p->branch_qn) != NULL;
+    int64_t branch_id = cbm_gbuf_upsert_node(gbuf, "Branch", branch_name, p->branch_qn, NULL, 0, 0,
+                                             branch_props);
+    if (branch_id <= 0) {
+        free(branch_props);
+        return CBM_NOT_FOUND;
+    }
+    if (!branch_existed) {
+        const cbm_gbuf_node_t *project_node = cbm_gbuf_find_by_qn(gbuf, p->project_name);
+        if (project_node &&
+            cbm_gbuf_insert_edge(gbuf, project_node->id, branch_id, "HAS_BRANCH",
+                                 branch_props) <= 0) {
+            free(branch_props);
+            return CBM_NOT_FOUND;
+        }
+    }
+    free(branch_props);
+    return 0;
+}
+
+bool cbm_pipeline_branch_metadata_changed(const cbm_pipeline_t *p, cbm_store_t *store) {
+    if (!p || !store || !p->branch_qn) {
+        return false;
+    }
+    char *branch_props = cbm_git_context_props_json_alloc(&p->git_ctx);
+    if (!branch_props || !project_active_branch_matches(p, store)) {
+        free(branch_props);
+        return true;
+    }
+    const char *expected_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
+    cbm_node_t stored = {0};
+    if (cbm_store_find_node_by_qn(store, p->project_name, p->branch_qn, &stored) != CBM_STORE_OK) {
+        free(branch_props);
+        return true;
+    }
+    bool changed = !stored.label || strcmp(stored.label, "Branch") != 0 || !stored.name ||
+                   strcmp(stored.name, expected_name) != 0 || !stored.properties_json ||
+                   strcmp(stored.properties_json, branch_props) != 0;
+    cbm_node_free_fields(&stored);
+    free(branch_props);
+    return changed;
+}
+
+static int add_tracked_discovery_exclusion(cbm_pipeline_t *p, const char *rel_path) {
+    p->ignored_total++;
+    if (!p->git_tracked_only && p->ignored_count >= CBM_DISCOVER_IGNORED_CAP) {
+        return 0;
+    }
+    if (p->git_tracked_only) {
+        if (!p->ignored_files || p->ignored_count >= p->tracked_path_count) {
+            return CBM_NOT_FOUND;
+        }
+    } else {
+        cbm_ignored_file_t *grown =
+            (cbm_ignored_file_t *)realloc(p->ignored_files,
+                                         (size_t)(p->ignored_count + 1) * sizeof(*grown));
+        if (!grown) {
+            return CBM_NOT_FOUND;
+        }
+        p->ignored_files = grown;
+    }
+    cbm_ignored_file_t *entry = &p->ignored_files[p->ignored_count];
+    entry->rel_path = strdup(rel_path);
+    entry->reason = strdup("not-indexable-by-discovery");
+    if (!entry->rel_path || !entry->reason) {
+        free(entry->rel_path);
+        free(entry->reason);
+        entry->rel_path = NULL;
+        entry->reason = NULL;
+        return CBM_NOT_FOUND;
+    }
+    p->ignored_count++;
+    return 0;
+}
+
+static bool path_has_suffix(const char *path, const char *suffix) {
+    if (!path || !suffix) {
+        return false;
+    }
+    size_t path_len = strlen(path);
+    size_t suffix_len = strlen(suffix);
+    return path_len >= suffix_len && strcmp(path + path_len - suffix_len, suffix) == 0;
+}
+
+static char *trusted_nominal_path(const cbm_pipeline_t *p, const char *rel_path) {
+    if (!p || !p->repo_path || !rel_path || !rel_path[0] || rel_path[0] == '/') {
+        return NULL;
+    }
+    size_t root_len = strlen(p->repo_path);
+    size_t rel_len = strlen(rel_path);
+    if (root_len > SIZE_MAX - rel_len - PAIR_LEN) {
+        return NULL;
+    }
+    char *path = (char *)malloc(root_len + rel_len + PAIR_LEN);
+    if (!path) {
+        return NULL;
+    }
+    snprintf(path, root_len + rel_len + PAIR_LEN, "%s/%s", p->repo_path, rel_path);
+    return path;
+}
+
+static bool trusted_path_has_skipped_directory(const char *rel_path) {
+    if (!rel_path) {
+        return true;
+    }
+    const char *component = rel_path;
+    for (const char *slash = strchr(component, '/'); slash;
+         slash = strchr(component, '/')) {
+        size_t len = (size_t)(slash - component);
+        if (len == 0 || len >= CBM_DIRENT_NAME_MAX) {
+            return true;
+        }
+        char name[CBM_DIRENT_NAME_MAX];
+        memcpy(name, component, len);
+        name[len] = '\0';
+        if (cbm_should_skip_dir(name, CBM_MODE_FULL)) {
+            return true;
+        }
+        component = slash + 1;
+    }
+    return false;
+}
+
+static int trusted_path_depth(const char *rel_path) {
+    int depth = 0;
+    for (const char *p = rel_path; p && *p; p++) {
+        if (*p == '/') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Tracked non-source files whose contents can affect graph resolution. These
+ * are hash-bound inputs, not coverage exclusions. User/global configuration
+ * and ignore files are deliberately absent: trust mode does not consume them. */
+static bool is_graph_auxiliary_path(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    const char *slash = strrchr(rel_path, '/');
+    const char *basename = slash ? slash + SKIP_ONE : rel_path;
+    return strcmp(basename, "package.json") == 0 || strcmp(basename, "go.mod") == 0 ||
+           strcmp(basename, "Cargo.toml") == 0 || strcmp(basename, "pyproject.toml") == 0 ||
+           strcmp(basename, "composer.json") == 0 || strcmp(basename, "pubspec.yaml") == 0 ||
+           strcmp(basename, "pom.xml") == 0 || strcmp(basename, "build.gradle") == 0 ||
+           strcmp(basename, "build.gradle.kts") == 0 || strcmp(basename, "mix.exs") == 0 ||
+           strcmp(basename, "tsconfig.json") == 0 || strcmp(basename, "jsconfig.json") == 0 ||
+           path_has_suffix(basename, ".gemspec");
+}
+
+/* One canonical predicate defines the trusted auxiliary corpus. It must be
+ * used both while capturing current inputs and while classifying stored hash
+ * rows; otherwise a recognized-but-depth-excluded manifest becomes a
+ * permanent false mismatch on every subsequent strict admission. */
+static bool is_graph_auxiliary_path_eligible(const char *rel_path) {
+    if (!is_graph_auxiliary_path(rel_path) ||
+        trusted_path_has_skipped_directory(rel_path)) {
+        return false;
+    }
+    const char *basename = strrchr(rel_path, '/');
+    basename = basename ? basename + 1 : rel_path;
+    int depth = trusted_path_depth(rel_path);
+    bool alias_config = strcmp(basename, "tsconfig.json") == 0 ||
+                        strcmp(basename, "jsconfig.json") == 0;
+    return alias_config ? depth <= 32 : depth < 64;
+}
+
+static int refresh_graph_auxiliary_files(cbm_pipeline_t *p) {
+    cbm_discover_free(p->auxiliary_files, p->auxiliary_file_count);
+    p->auxiliary_files = NULL;
+    free(p->auxiliary_snapshots);
+    p->auxiliary_snapshots = NULL;
+    p->auxiliary_file_count = 0;
+    if (!p->git_tracked_only || p->tracked_path_count == 0) {
+        return 0;
+    }
+
+    cbm_file_info_t *aux =
+        (cbm_file_info_t *)calloc((size_t)p->tracked_path_count, sizeof(*aux));
+    if (!aux) {
+        return CBM_NOT_FOUND;
+    }
+    int count = 0;
+    for (int i = 0; i < p->tracked_path_count; i++) {
+        const char *rel_path = p->tracked_paths[i];
+        if (!is_graph_auxiliary_path_eligible(rel_path)) {
+            continue;
+        }
+        aux[count].path = trusted_nominal_path(p, rel_path);
+        aux[count].rel_path = strdup(rel_path);
+        aux[count].language = CBM_LANG_COUNT;
+        aux[count].size = 0;
+        if (!aux[count].path || !aux[count].rel_path) {
+            cbm_discover_free(aux, count + 1);
+            return CBM_NOT_FOUND;
+        }
+        count++;
+    }
+    if (count == 0) {
+        free(aux);
+        return 0;
+    }
+    p->auxiliary_files = aux;
+    p->auxiliary_file_count = count;
+    if (cbm_pipeline_capture_file_snapshots(p, p->auxiliary_files, p->auxiliary_file_count,
+                                            &p->auxiliary_snapshots) != 0) {
+        cbm_discover_free(p->auxiliary_files, p->auxiliary_file_count);
+        p->auxiliary_files = NULL;
+        p->auxiliary_file_count = 0;
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("pipeline.git_auxiliary", "files", itoa_buf(p->auxiliary_file_count));
+    return 0;
+}
+
+/* Trust mode derives its corpus directly from Git's NUL-framed manifest.
+ * It never walks the untracked filesystem, so an untracked directory fanout
+ * cannot affect memory, latency, or graph membership. */
+static int discover_tracked_files(cbm_pipeline_t *p, cbm_file_info_t **out, int *file_count) {
+    if (!p || !p->git_tracked_only || !out || !file_count) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    *file_count = 0;
+    cbm_git_free_tracked_files(p->tracked_paths, p->tracked_path_count);
+    p->tracked_paths = NULL;
+    p->tracked_path_count = 0;
+    if (!p->git_ctx.is_git ||
+        !cbm_trusted_root_matches_path(p->trusted_root, p->repo_path) ||
+        cbm_git_list_tracked_files_trusted(p->repo_path, p->trusted_root,
+                                           &p->tracked_paths,
+                                           &p->tracked_path_count) != 0) {
+        cbm_log_error("pipeline.err", "phase", "git_tracked_files", "reason",
+                      p->git_ctx.is_git ? "enumeration_failed" : "not_a_git_repository");
+        return CBM_NOT_FOUND;
+    }
+    if (refresh_graph_auxiliary_files(p) != 0) {
+        cbm_log_error("pipeline.err", "phase", "git_auxiliary_snapshot");
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
+    p->excluded_dirs = NULL;
+    p->excluded_count = 0;
+    cbm_discover_free_ignored(p->ignored_files, p->ignored_count);
+    p->ignored_files = NULL;
+    p->ignored_count = 0;
+    p->ignored_total = 0;
+    if (p->tracked_path_count > 0) {
+        p->ignored_files =
+            (cbm_ignored_file_t *)calloc((size_t)p->tracked_path_count,
+                                         sizeof(*p->ignored_files));
+        if (!p->ignored_files) {
+            return CBM_NOT_FOUND;
+        }
+    }
+    cbm_file_info_t *files =
+        p->tracked_path_count > 0
+            ? (cbm_file_info_t *)calloc((size_t)p->tracked_path_count, sizeof(*files))
+            : NULL;
+    if (p->tracked_path_count > 0 && !files) {
+        return CBM_NOT_FOUND;
+    }
+    int kept = 0;
+    for (int i = 0; i < p->tracked_path_count; i++) {
+        const char *rel_path = p->tracked_paths[i];
+        const char *basename = strrchr(rel_path, '/');
+        basename = basename ? basename + 1 : rel_path;
+        CBMLanguage language = cbm_language_for_filename(basename);
+        bool indexable =
+            language != CBM_LANG_COUNT &&
+            !trusted_path_has_skipped_directory(rel_path) &&
+            !cbm_has_ignored_suffix(basename, CBM_MODE_FULL) &&
+            !cbm_should_skip_filename(basename, CBM_MODE_FULL) &&
+            !cbm_matches_fast_pattern(basename, CBM_MODE_FULL);
+        if (!indexable) {
+            if (cbm_pipeline_path_is_auxiliary(p, rel_path)) {
+                continue;
+            }
+            if (add_tracked_discovery_exclusion(p, rel_path) != 0) {
+                cbm_discover_free(files, kept);
+                return CBM_NOT_FOUND;
+            }
+            continue;
+        }
+        files[kept].path = trusted_nominal_path(p, rel_path);
+        files[kept].rel_path = strdup(rel_path);
+        files[kept].language = language;
+        if (!files[kept].path || !files[kept].rel_path) {
+            cbm_discover_free(files, kept + 1);
+            return CBM_NOT_FOUND;
+        }
+        kept++;
+    }
+    *out = files;
+    *file_count = kept;
+    cbm_log_info("pipeline.git_tracked_only", "tracked", itoa_buf(p->tracked_path_count),
+                 "source_candidates", itoa_buf(kept), "auxiliary",
+                 itoa_buf(p->auxiliary_file_count));
+    return 0;
 }
 
 /* Effective worker count. The crash supervisor re-runs its worker single-
@@ -505,20 +1272,8 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     /* Project node */
     cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
     const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
-    const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
-    char branch_props[CBM_SZ_2K];
-    const char *branch_props_json = "{}";
-    if (cbm_git_context_props_json(&p->git_ctx, branch_props, sizeof(branch_props)) > 0) {
-        branch_props_json = branch_props;
-    }
-    if (p->branch_qn) {
-        int64_t branch_id = cbm_gbuf_upsert_node(p->gbuf, "Branch", branch_name, branch_qn, NULL, 0,
-                                                 0, branch_props_json);
-        const cbm_gbuf_node_t *project_node = cbm_gbuf_find_by_qn(p->gbuf, p->project_name);
-        if (project_node && branch_id > 0) {
-            cbm_gbuf_insert_edge(p->gbuf, project_node->id, branch_id, "HAS_BRANCH",
-                                 branch_props_json);
-        }
+    if (cbm_pipeline_upsert_branch_metadata(p, p->gbuf) != 0) {
+        return CBM_NOT_FOUND;
     }
 
     /* Collect unique directories and create Folder/Package nodes */
@@ -868,13 +1623,14 @@ static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_i
  * Returns NULL (and does no work) when no ObjectScript include files exist.
  * Caller owns the returned heap table (free via cbm_macro_table_free). */
 CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
-                                                const char *repo_path) {
+                                                const char *repo_path,
+                                                cbm_pipeline_t *pipeline) {
     (void)repo_path;
     bool has_inc = false;
     for (int i = 0; i < count; i++) {
-        if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].path &&
-            (strrchr(files[i].path, '.') != NULL &&
-             strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
+        if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].rel_path &&
+            (strrchr(files[i].rel_path, '.') != NULL &&
+             strcmp(strrchr(files[i].rel_path, '.'), ".inc") == 0)) {
             has_inc = true;
             break;
         }
@@ -895,8 +1651,9 @@ CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, in
         if (files[i].language != CBM_LANG_OBJECTSCRIPT_ROUTINE) {
             continue;
         }
-        if (!files[i].path || !(strrchr(files[i].path, '.') != NULL &&
-                                strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
+        if (!files[i].path || !files[i].rel_path ||
+            !(strrchr(files[i].rel_path, '.') != NULL &&
+              strcmp(strrchr(files[i].rel_path, '.'), ".inc") == 0)) {
             continue;
         }
         FILE *f = cbm_fopen(files[i].path, "rb");
@@ -909,9 +1666,10 @@ CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, in
         if (fsize > 0) {
             char *src = (char *)malloc((size_t)fsize + 1);
             if (src) {
-                size_t nread = fread(src, 1, (size_t)fsize, f);
-                src[nread] = '\0';
-                cbm_parse_inc_file(mt, &mt->arena, src);
+                if (cbm_pipeline_fread_exact(pipeline, f, src, (size_t)fsize)) {
+                    src[fsize] = '\0';
+                    cbm_parse_inc_file(mt, &mt->arena, src);
+                }
                 free(src);
             }
         }
@@ -929,9 +1687,9 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * Use the repo-walking variant so manifests filtered out by the main
      * discoverer (package.json, composer.json) still feed pkgmap and let
      * workspace imports like `@my/pkg` resolve to their target Module. */
-    cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count,
-                                                       ctx->project_name, ctx->excluded_dirs,
-                                                       ctx->excluded_count));
+    cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_repo_trusted(
+        ctx->repo_path, files, file_count, ctx->project_name, ctx->excluded_dirs,
+        ctx->excluded_count, ctx->pipeline));
 
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
@@ -940,7 +1698,8 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 
     /* ObjectScript: build the $$$macro table from .inc include files so that
      * pass_calls can resolve macro-mediated dispatch. NULL when not present. */
-    CBMMacroTable *mt = cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+    CBMMacroTable *mt =
+        cbm_build_macro_table_from_files(files, file_count, ctx->repo_path, ctx->pipeline);
     if (mt) {
         ctx->macro_table = mt;
     }
@@ -1155,9 +1914,299 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
+static bool sha256_hex_is_valid(const char *digest) {
+    if (!digest || strlen(digest) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (int i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((digest[i] >= '0' && digest[i] <= '9') ||
+              (digest[i] >= 'a' && digest[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool trusted_auxiliary_hashes_match(const cbm_pipeline_t *p,
+                                           const cbm_file_hash_t *stored, int stored_count) {
+    if (!p || !p->git_tracked_only) {
+        return true;
+    }
+    CBMHashTable *stored_by_path =
+        cbm_ht_create(stored_count > 0 ? (uint32_t)stored_count * PAIR_LEN : CBM_SZ_64);
+    CBMHashTable *current_aux =
+        cbm_ht_create(p->auxiliary_file_count > 0
+                          ? (uint32_t)p->auxiliary_file_count * PAIR_LEN
+                          : CBM_SZ_64);
+    if (!stored_by_path || !current_aux) {
+        cbm_ht_free(stored_by_path);
+        cbm_ht_free(current_aux);
+        return false;
+    }
+    for (int i = 0; i < stored_count; i++) {
+        cbm_ht_set(stored_by_path, stored[i].rel_path, (void *)&stored[i]);
+    }
+    bool matches = true;
+    for (int i = 0; i < p->auxiliary_file_count; i++) {
+        const char *rel_path = p->auxiliary_files[i].rel_path;
+        cbm_ht_set(current_aux, rel_path, (void *)&p->auxiliary_files[i]);
+        const cbm_file_hash_t *old = cbm_ht_get(stored_by_path, rel_path);
+        if (!old || !sha256_hex_is_valid(old->sha256) ||
+            strcmp(old->sha256, p->auxiliary_snapshots[i].sha256) != 0) {
+            matches = false;
+        }
+    }
+    for (int i = 0; matches && i < stored_count; i++) {
+        if (is_graph_auxiliary_path_eligible(stored[i].rel_path) &&
+            !cbm_ht_get(current_aux, stored[i].rel_path)) {
+            matches = false;
+        }
+    }
+    cbm_ht_free(stored_by_path);
+    cbm_ht_free(current_aux);
+    return matches;
+}
+
+static bool trusted_source_hashes_match(const cbm_pipeline_t *p, const cbm_file_info_t *files,
+                                        int file_count, const cbm_file_snapshot_t *snapshots,
+                                        const cbm_file_hash_t *stored, int stored_count) {
+    if (!p || !p->git_tracked_only || file_count < 0 ||
+        (file_count > 0 && (!files || !snapshots))) {
+        return false;
+    }
+    CBMHashTable *stored_by_path =
+        cbm_ht_create(stored_count > 0 ? (uint32_t)stored_count * PAIR_LEN : CBM_SZ_64);
+    CBMHashTable *current_source =
+        cbm_ht_create(file_count > 0 ? (uint32_t)file_count * PAIR_LEN : CBM_SZ_64);
+    if (!stored_by_path || !current_source) {
+        cbm_ht_free(stored_by_path);
+        cbm_ht_free(current_source);
+        return false;
+    }
+    for (int i = 0; i < stored_count; i++) {
+        cbm_ht_set(stored_by_path, stored[i].rel_path, (void *)&stored[i]);
+    }
+    bool matches = true;
+    for (int i = 0; i < file_count; i++) {
+        cbm_ht_set(current_source, files[i].rel_path, (void *)&files[i]);
+        const cbm_file_hash_t *old = cbm_ht_get(stored_by_path, files[i].rel_path);
+        if (!old || !sha256_hex_is_valid(old->sha256) ||
+            strcmp(old->sha256, snapshots[i].sha256) != 0) {
+            matches = false;
+        }
+    }
+    for (int i = 0; matches && i < stored_count; i++) {
+        if (!cbm_ht_get(current_source, stored[i].rel_path) &&
+            !cbm_pipeline_path_is_auxiliary(p, stored[i].rel_path) &&
+            /* A legacy generation may contain a hash for a recognized
+             * manifest that the canonical depth/skip predicate now excludes.
+             * Such an input cannot shape the current graph, so it must not
+             * poison admission forever. Eligible auxiliaries are checked by
+             * trusted_auxiliary_hashes_match above. */
+            !is_graph_auxiliary_path(stored[i].rel_path)) {
+            matches = false;
+        }
+    }
+    cbm_ht_free(stored_by_path);
+    cbm_ht_free(current_source);
+    return matches;
+}
+
+static bool trusted_coverage_matches(const cbm_pipeline_t *p, cbm_store_t *store) {
+    if (!p || !store || !p->git_tracked_only) {
+        return false;
+    }
+    cbm_coverage_meta_t meta = {0};
+    cbm_project_t project = {0};
+    bool meta_loaded =
+        cbm_store_coverage_meta_get(store, p->project_name, &meta) == CBM_STORE_OK;
+    bool project_loaded =
+        cbm_store_get_project(store, p->project_name, &project) == CBM_STORE_OK;
+    bool meta_matches =
+        meta_loaded && project_loaded && meta.generation && project.indexed_at &&
+        strcmp(meta.generation, project.indexed_at) == 0 && meta.index_mode &&
+        strcmp(meta.index_mode, "full") == 0 && meta.recording_status &&
+        strcmp(meta.recording_status, "complete") == 0 && meta.coverage_version == 1 &&
+        meta.hash_records_complete && p->ignored_total == p->ignored_count &&
+        meta.ignored_files_stored == p->ignored_count &&
+        meta.ignored_files_total == p->ignored_total;
+    cbm_store_coverage_meta_clear(&meta);
+    if (project_loaded) {
+        cbm_project_free_fields(&project);
+    }
+    if (!meta_matches) {
+        return false;
+    }
+
+    cbm_coverage_row_t *coverage = NULL;
+    int coverage_count = 0;
+    if (cbm_store_coverage_get(store, p->project_name, &coverage, &coverage_count) !=
+        CBM_STORE_OK) {
+        return false;
+    }
+    CBMHashTable *current =
+        cbm_ht_create(p->ignored_count > 0 ? (uint32_t)p->ignored_count * PAIR_LEN : CBM_SZ_64);
+    if (!current) {
+        cbm_store_free_coverage(coverage, coverage_count);
+        return false;
+    }
+    for (int i = 0; i < p->ignored_count; i++) {
+        cbm_ht_set(current, p->ignored_files[i].rel_path, (void *)&p->ignored_files[i]);
+    }
+    int stored_exact = 0;
+    bool matches = true;
+    for (int i = 0; i < coverage_count; i++) {
+        if (!coverage[i].kind || strcmp(coverage[i].kind, "not_indexed_file") != 0 ||
+            !coverage[i].rel_path || !cbm_ht_get(current, coverage[i].rel_path)) {
+            matches = false;
+            continue;
+        }
+        stored_exact++;
+    }
+    matches = matches && coverage_count == p->ignored_count &&
+              stored_exact == p->ignored_count;
+    cbm_ht_free(current);
+    cbm_store_free_coverage(coverage, coverage_count);
+    return matches;
+}
+
+static bool trusted_branch_identity_matches(const cbm_pipeline_t *p, cbm_store_t *store) {
+    if (!p || !store || !p->branch_qn) {
+        return false;
+    }
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    static const char sql[] =
+        "SELECT COUNT(*), "
+        "SUM(CASE WHEN qualified_name=?2 THEN 1 ELSE 0 END) "
+        "FROM nodes WHERE project=?1 AND label='Branch';";
+    if (!db || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, p->project_name, -1, NULL);
+    sqlite3_bind_text(stmt, 2, p->branch_qn, -1, NULL);
+    bool matches = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        matches = sqlite3_column_int(stmt, 0) == 1 && sqlite3_column_int(stmt, 1) == 1;
+    }
+    sqlite3_finalize(stmt);
+    return matches && project_active_branch_matches(p, store);
+}
+
+static int finalize_trusted_source_classification(cbm_pipeline_t *p,
+                                                  cbm_file_info_t *files,
+                                                  cbm_file_snapshot_t *snapshots,
+                                                  int *file_count);
+
+struct cbm_trusted_snapshot {
+    cbm_pipeline_t *pipeline;
+    cbm_file_info_t *files;
+    cbm_file_snapshot_t *snapshots;
+    int file_count;
+};
+
+void cbm_pipeline_trusted_snapshot_free(cbm_trusted_snapshot_t *snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    cbm_discover_free(snapshot->files, snapshot->file_count);
+    free(snapshot->snapshots);
+    cbm_pipeline_free(snapshot->pipeline);
+    free(snapshot);
+}
+
+int cbm_pipeline_trusted_snapshot_admit(const char *repo_path, const char *project,
+                                        cbm_store_t *store,
+                                        cbm_trusted_snapshot_t **out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    if (!repo_path || !project || !store || !cbm_store_check_integrity(store)) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_trusted_snapshot_t *admission =
+        (cbm_trusted_snapshot_t *)calloc(1, sizeof(*admission));
+    if (!admission) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, CBM_MODE_FULL);
+    cbm_file_info_t *files = NULL;
+    cbm_file_snapshot_t *snapshots = NULL;
+    cbm_file_hash_t *hashes = NULL;
+    int file_count = 0;
+    int hash_count = 0;
+    bool matches = false;
+    /* cbm_pipeline_new() already captured the admission-start Git context.
+     * Re-resolving it here spawned seven redundant Git processes without
+     * strengthening the boundary; verify_git_snapshot() below is the required
+     * post-corpus comparison against that start snapshot. */
+    if (!p || !p->git_tracked_only ||
+        !cbm_pipeline_set_project_name(p, project)) {
+        goto cleanup;
+    }
+    p->trusted_validation_only = true;
+    if (discover_tracked_files(p, &files, &file_count) != 0 ||
+        cbm_pipeline_capture_file_snapshots(p, files, file_count, &snapshots) != 0 ||
+        finalize_trusted_source_classification(p, files, snapshots, &file_count) != 0 ||
+        cbm_store_get_file_hashes(store, p->project_name, &hashes, &hash_count) !=
+            CBM_STORE_OK) {
+        goto cleanup;
+    }
+    matches =
+        trusted_source_hashes_match(p, files, file_count, snapshots, hashes, hash_count) &&
+        trusted_auxiliary_hashes_match(p, hashes, hash_count) &&
+        trusted_coverage_matches(p, store) && trusted_branch_identity_matches(p, store) &&
+        !cbm_pipeline_branch_metadata_changed(p, store) &&
+        pipeline_recipe_unchanged(p) &&
+        cbm_pipeline_verify_git_snapshot(p) == 0;
+
+cleanup:
+    cbm_store_free_file_hashes(hashes, hash_count);
+    if (!matches) {
+        cbm_discover_free(files, file_count);
+        free(snapshots);
+        cbm_pipeline_free(p);
+        free(admission);
+        return CBM_NOT_FOUND;
+    }
+    admission->pipeline = p;
+    admission->files = files;
+    admission->snapshots = snapshots;
+    admission->file_count = file_count;
+    *out = admission;
+    return 0;
+}
+
+bool cbm_pipeline_trusted_snapshot_verify(cbm_trusted_snapshot_t *snapshot) {
+    cbm_pipeline_t *p = snapshot ? snapshot->pipeline : NULL;
+    return p && pipeline_recipe_unchanged(p) &&
+           cbm_pipeline_verify_git_snapshot(p) == 0 &&
+           cbm_pipeline_verify_file_snapshots(
+               p, snapshot->files, snapshot->file_count,
+               snapshot->snapshots) == 0 &&
+           cbm_pipeline_verify_file_snapshots(
+               p, p->auxiliary_files, p->auxiliary_file_count,
+               p->auxiliary_snapshots) == 0;
+}
+
+bool cbm_pipeline_trusted_snapshot_matches_store(const char *repo_path,
+                                                 const char *project,
+                                                 cbm_store_t *store) {
+    cbm_trusted_snapshot_t *snapshot = NULL;
+    bool matches =
+        cbm_pipeline_trusted_snapshot_admit(repo_path, project, store,
+                                            &snapshot) == 0 &&
+        cbm_pipeline_trusted_snapshot_verify(snapshot) &&
+        cbm_store_strict_snapshot_valid(store);
+    cbm_pipeline_trusted_snapshot_free(snapshot);
+    return matches;
+}
+
 /* Try incremental pipeline or delete old DB for reindex.
  * Returns >= 0 if incremental was used (the return code), or -1 to proceed with full. */
-static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
+static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
+                                        cbm_file_snapshot_t *snapshots) {
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_NOT_FOUND;
@@ -1171,15 +2220,39 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     if (check_store && cbm_store_check_integrity(check_store)) {
         cbm_file_hash_t *hashes = NULL;
         int hash_count = 0;
-        cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
+        bool hashes_loaded =
+            cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count) ==
+            CBM_STORE_OK;
+        bool branch_identity_requires_full =
+            !trusted_branch_identity_matches(p, check_store);
+        bool trust_requires_full =
+            p->git_tracked_only &&
+            (!hashes_loaded ||
+             !trusted_source_hashes_match(p, files, file_count, snapshots, hashes, hash_count) ||
+             !trusted_auxiliary_hashes_match(p, hashes, hash_count) ||
+             !trusted_coverage_matches(p, check_store) ||
+             branch_identity_requires_full ||
+             cbm_pipeline_branch_metadata_changed(p, check_store));
         cbm_store_free_file_hashes(hashes, hash_count);
         cbm_store_close(check_store);
-        if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
+        /* The only trusted no-op gate runs against the published DB before
+         * staging is created. Reaching a staging DB means that gate failed,
+         * so trust mode must rebuild rather than replace the final DB with a
+         * byte-equivalent backup. */
+        trust_requires_full = trust_requires_full || p->git_tracked_only;
+        if (!trust_requires_full && !branch_identity_requires_full && hash_count > 0 &&
+            file_count <= hash_count + (hash_count / PAIR_LEN)) {
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
             free(db_path);
             return rc;
+        }
+        if (trust_requires_full) {
+            cbm_log_info("pipeline.route", "path", "trusted_input_change_reindex");
+        }
+        if (branch_identity_requires_full) {
+            cbm_log_info("pipeline.route", "path", "branch_change_reindex");
         }
         if (hash_count > 0) {
             cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
@@ -1223,6 +2296,563 @@ static int64_t stat_mtime_ns(const struct stat *fst) {
 #endif
 }
 
+static int portable_file_stat(const char *path, struct stat *st) {
+#ifdef _WIN32
+    wchar_t *wpath = cbm_path_to_wide(path);
+    if (!wpath) {
+        return CBM_NOT_FOUND;
+    }
+    struct _stat64 wide_st;
+    int rc = _wstat64(wpath, &wide_st);
+    free(wpath);
+    if (rc != 0) {
+        return CBM_NOT_FOUND;
+    }
+    memset(st, 0, sizeof(*st));
+    st->st_mode = wide_st.st_mode;
+    st->st_size = wide_st.st_size;
+    st->st_mtime = wide_st.st_mtime;
+    return 0;
+#else
+    return stat(path, st);
+#endif
+}
+
+static bool ensure_trusted_snapshot_dir(cbm_pipeline_t *p) {
+    if (!p || !p->git_tracked_only) {
+        return false;
+    }
+    if (p->trusted_snapshot_dir) {
+        return true;
+    }
+    const char *tmp = cbm_tmpdir();
+    if (!tmp || !tmp[0]) {
+        return false;
+    }
+    static const char suffix[] = "/cbm-trusted-snapshot-XXXXXX";
+    size_t tmp_len = strlen(tmp);
+    if (tmp_len > SIZE_MAX - sizeof(suffix)) {
+        return false;
+    }
+    char *dir = (char *)malloc(tmp_len + sizeof(suffix));
+    if (!dir) {
+        return false;
+    }
+    snprintf(dir, tmp_len + sizeof(suffix), "%s%s", tmp, suffix);
+    if (!cbm_mkdtemp(dir)) {
+        free(dir);
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_path_to_wide(dir);
+    HANDLE handle =
+        wide ? CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS |
+                               FILE_FLAG_OPEN_REPARSE_POINT,
+                           NULL)
+             : INVALID_HANDLE_VALUE;
+    free(wide);
+    FILE_ATTRIBUTE_TAG_INFO tag = {0};
+    BY_HANDLE_FILE_INFORMATION identity = {0};
+    bool anchored =
+        handle != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &tag,
+                                     sizeof(tag)) &&
+        !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        GetFileInformationByHandle(handle, &identity);
+    if (!anchored) {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+        }
+        (void)cbm_rmdir(dir);
+        free(dir);
+        return false;
+    }
+    p->trusted_snapshot_dir_handle = handle;
+    p->trusted_snapshot_dir_identity = identity;
+#else
+    int flags = O_RDONLY | O_DIRECTORY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(dir, flags);
+    struct stat status;
+    if (fd < 0 || fstat(fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        (void)cbm_rmdir(dir);
+        free(dir);
+        return false;
+    }
+    p->trusted_snapshot_dir_fd = fd;
+    p->trusted_snapshot_dir_device = status.st_dev;
+    p->trusted_snapshot_dir_inode = status.st_ino;
+#endif
+    p->trusted_snapshot_dir = dir;
+    return true;
+}
+
+static bool trusted_snapshot_dir_matches(const cbm_pipeline_t *p) {
+    if (!p || !p->trusted_snapshot_dir) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_path_to_wide(p->trusted_snapshot_dir);
+    HANDLE probe =
+        wide ? CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS |
+                               FILE_FLAG_OPEN_REPARSE_POINT,
+                           NULL)
+             : INVALID_HANDLE_VALUE;
+    free(wide);
+    FILE_ATTRIBUTE_TAG_INFO tag = {0};
+    BY_HANDLE_FILE_INFORMATION identity = {0};
+    bool matches =
+        probe != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandleEx(probe, FileAttributeTagInfo, &tag,
+                                     sizeof(tag)) &&
+        !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+        GetFileInformationByHandle(probe, &identity) &&
+        identity.dwVolumeSerialNumber ==
+            p->trusted_snapshot_dir_identity.dwVolumeSerialNumber &&
+        identity.nFileIndexHigh ==
+            p->trusted_snapshot_dir_identity.nFileIndexHigh &&
+        identity.nFileIndexLow ==
+            p->trusted_snapshot_dir_identity.nFileIndexLow;
+    if (probe != INVALID_HANDLE_VALUE) {
+        CloseHandle(probe);
+    }
+    return matches;
+#else
+    int flags = O_RDONLY | O_DIRECTORY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int probe = open(p->trusted_snapshot_dir, flags);
+    struct stat status;
+    bool matches =
+        probe >= 0 && fstat(probe, &status) == 0 &&
+        S_ISDIR(status.st_mode) &&
+        status.st_dev == p->trusted_snapshot_dir_device &&
+        status.st_ino == p->trusted_snapshot_dir_inode;
+    if (probe >= 0) {
+        close(probe);
+    }
+    return matches;
+#endif
+}
+
+static bool seal_trusted_snapshot_dir(cbm_pipeline_t *p) {
+    if (!p || p->trusted_validation_only || !p->trusted_snapshot_dir) {
+        return true;
+    }
+    if (!trusted_snapshot_dir_matches(p)) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_path_to_wide(p->trusted_snapshot_dir);
+    DWORD attributes = wide ? GetFileAttributesW(wide) : INVALID_FILE_ATTRIBUTES;
+    bool ok = attributes != INVALID_FILE_ATTRIBUTES &&
+              SetFileAttributesW(wide, attributes | FILE_ATTRIBUTE_READONLY);
+    free(wide);
+    return ok;
+#else
+    return chmod(p->trusted_snapshot_dir, 0500) == 0;
+#endif
+}
+
+/* Store captured bytes in one owner-private scratch directory. Files are
+ * closed immediately and made read-only, so descriptor/handle usage stays
+ * O(1) even for very large repositories. The directory is sealed before any
+ * parser consumes it and every copy is rehashed at dump/publish boundaries. */
+static char *write_trusted_snapshot_copy(cbm_pipeline_t *p, const cbm_file_info_t *file,
+                                         const unsigned char *data, size_t len) {
+    if (!p || !file || !file->rel_path || (!data && len > 0) ||
+        !ensure_trusted_snapshot_dir(p) ||
+        !trusted_snapshot_dir_matches(p)) {
+        return NULL;
+    }
+    const char *basename = strrchr(file->rel_path, '/');
+    basename = basename ? basename + 1 : file->rel_path;
+    const char *extension = strrchr(basename, '.');
+    if (!extension || strlen(extension) > CBM_SZ_32) {
+        extension = "";
+    }
+    size_t dir_len = strlen(p->trusted_snapshot_dir);
+    size_t extension_len = strlen(extension);
+    if (dir_len > SIZE_MAX - extension_len - CBM_SZ_32) {
+        return NULL;
+    }
+    size_t path_size = dir_len + extension_len + CBM_SZ_32;
+    char *path = (char *)malloc(path_size);
+    if (!path) {
+        return NULL;
+    }
+    unsigned int serial = p->trusted_snapshot_serial++;
+    char internal_name[CBM_SZ_64];
+    int internal_n =
+        snprintf(internal_name, sizeof(internal_name), "%08x%s", serial, extension);
+    int n = internal_n > 0 && (size_t)internal_n < sizeof(internal_name)
+                ? snprintf(path, path_size, "%s/%s", p->trusted_snapshot_dir,
+                           internal_name)
+                : CBM_NOT_FOUND;
+    if (n < 0 || (size_t)n >= path_size) {
+        free(path);
+        return NULL;
+    }
+#ifdef _WIN32
+    wchar_t *wide_path = cbm_path_to_wide(path);
+    HANDLE handle =
+        wide_path ? CreateFileW(wide_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL)
+                  : INVALID_HANDLE_VALUE;
+    free(wide_path);
+    if (handle == INVALID_HANDLE_VALUE) {
+        free(path);
+        return NULL;
+    }
+    size_t written = 0;
+    bool ok = true;
+    while (written < len) {
+        DWORD chunk = (DWORD)((len - written) > UINT32_MAX ? UINT32_MAX : (len - written));
+        DWORD count = 0;
+        if (!WriteFile(handle, data + written, chunk, &count, NULL) || count == 0) {
+            ok = false;
+            break;
+        }
+        written += count;
+    }
+    BY_HANDLE_FILE_INFORMATION identity = {0};
+    ok = ok && written == len && GetFileInformationByHandle(handle, &identity) &&
+         !(identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+         identity.nNumberOfLinks == 1;
+    CloseHandle(handle);
+    handle = INVALID_HANDLE_VALUE;
+    wide_path = cbm_path_to_wide(path);
+    ok = ok && wide_path &&
+         SetFileAttributesW(wide_path,
+                            FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_TEMPORARY);
+    free(wide_path);
+    if (!ok) {
+        (void)cbm_unlink(path);
+        free(path);
+        return NULL;
+    }
+    return path;
+#else
+    int flags = O_CREAT | O_EXCL | O_WRONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = openat(p->trusted_snapshot_dir_fd, internal_name, flags, 0600);
+    if (fd < 0) {
+        free(path);
+        return NULL;
+    }
+    size_t written = 0;
+    bool ok = true;
+    while (written < len) {
+        ssize_t count = write(fd, data + written, len - written);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            ok = false;
+            break;
+        }
+        written += (size_t)count;
+    }
+    struct stat status;
+    ok = ok && written == len && fstat(fd, &status) == 0 &&
+         S_ISREG(status.st_mode) && status.st_nlink == 1 &&
+         fchmod(fd, 0400) == 0;
+    if (close(fd) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        (void)cbm_unlink(path);
+        free(path);
+        return NULL;
+    }
+#ifdef __linux__
+    int pseudo_len =
+        snprintf(NULL, 0, "/proc/self/fd/%d/%s",
+                 p->trusted_snapshot_dir_fd, internal_name);
+    char *pseudo = pseudo_len >= 0
+                       ? (char *)malloc((size_t)pseudo_len + 1)
+                       : NULL;
+    if (!pseudo) {
+        free(path);
+        return NULL;
+    }
+    snprintf(pseudo, (size_t)pseudo_len + 1, "/proc/self/fd/%d/%s",
+             p->trusted_snapshot_dir_fd, internal_name);
+    free(path);
+    return pseudo;
+#else
+    return path;
+#endif
+#endif
+}
+
+static int trusted_auxiliary_index(const cbm_pipeline_t *p, const char *rel_path) {
+    if (!p || !rel_path || !p->auxiliary_files) {
+        return CBM_NOT_FOUND;
+    }
+    int lo = 0;
+    int hi = p->auxiliary_file_count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        int cmp = strcmp(rel_path, p->auxiliary_files[mid].rel_path);
+        if (cmp == 0) {
+            return mid;
+        }
+        if (cmp < 0) {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return CBM_NOT_FOUND;
+}
+
+static int capture_one_file_snapshot(cbm_pipeline_t *p, cbm_file_info_t *file,
+                                     cbm_file_snapshot_t *snapshot) {
+    if (!p || !file || !file->path || !file->rel_path || !snapshot) {
+        return CBM_NOT_FOUND;
+    }
+    if (p->git_tracked_only) {
+        int auxiliary_index =
+            p->auxiliary_snapshots ? trusted_auxiliary_index(p, file->rel_path)
+                                   : CBM_NOT_FOUND;
+        if (!p->trusted_validation_only && auxiliary_index >= 0 &&
+            &p->auxiliary_files[auxiliary_index] != file) {
+            char *shared_path = strdup(p->auxiliary_files[auxiliary_index].path);
+            if (!shared_path) {
+                return CBM_NOT_FOUND;
+            }
+            if (file->language != CBM_LANG_COUNT) {
+                const char *basename = strrchr(file->rel_path, '/');
+                basename = basename ? basename + 1 : file->rel_path;
+                file->language =
+                    cbm_discover_detect_file_language(
+                        basename, p->auxiliary_files[auxiliary_index].path);
+            }
+            free(file->path);
+            file->path = shared_path;
+            file->size = p->auxiliary_files[auxiliary_index].size;
+            *snapshot = p->auxiliary_snapshots[auxiliary_index];
+            return 0;
+        }
+        unsigned char *bytes = NULL;
+        size_t byte_count = 0;
+        struct stat status;
+        long configured_limit = cbm_max_file_bytes();
+        size_t max_bytes =
+            configured_limit > 0 ? (size_t)configured_limit : SIZE_MAX;
+        if (!p->trusted_root ||
+            cbm_trusted_root_read_file(p->trusted_root, file->rel_path, max_bytes, &bytes,
+                                       &byte_count, &status) != 0) {
+            cbm_log_error("pipeline.snapshot", "status", "unreadable_tracked_file",
+                          "rel_path", file->rel_path);
+            return CBM_NOT_FOUND;
+        }
+        if (file->language != CBM_LANG_COUNT) {
+            const char *basename = strrchr(file->rel_path, '/');
+            basename = basename ? basename + 1 : file->rel_path;
+            file->language =
+                cbm_discover_detect_file_language_bytes(basename, bytes, byte_count);
+        }
+        cbm_sha256_hex(bytes, byte_count, snapshot->sha256);
+        char *copy = NULL;
+        if (!p->trusted_validation_only) {
+            copy = write_trusted_snapshot_copy(p, file, bytes, byte_count);
+            if (!copy) {
+                free(bytes);
+                return CBM_NOT_FOUND;
+            }
+        }
+        free(bytes);
+        if (copy) {
+            free(file->path);
+            file->path = copy;
+        }
+        file->size = (int64_t)byte_count;
+        snapshot->mtime_ns = stat_mtime_ns(&status);
+        snapshot->size = (int64_t)byte_count;
+        return 0;
+    }
+    struct stat before;
+    struct stat after;
+    int before_rc = portable_file_stat(file->path, &before);
+    int hash_rc =
+        before_rc == 0 ? cbm_sha256_file(file->path, snapshot->sha256) : CBM_NOT_FOUND;
+    int after_rc = portable_file_stat(file->path, &after);
+    if (before_rc != 0 || hash_rc != 0 || after_rc != 0 ||
+        stat_mtime_ns(&before) != stat_mtime_ns(&after) ||
+        before.st_size != after.st_size) {
+        cbm_log_error("pipeline.snapshot", "status", "unstable_or_unreadable", "rel_path",
+                      file->rel_path);
+        return CBM_NOT_FOUND;
+    }
+    snapshot->mtime_ns = stat_mtime_ns(&after);
+    snapshot->size = after.st_size;
+    return 0;
+}
+
+static int finalize_trusted_source_classification(cbm_pipeline_t *p, cbm_file_info_t *files,
+                                                  cbm_file_snapshot_t *snapshots,
+                                                  int *file_count) {
+    if (!p || !file_count || *file_count < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (*file_count == 0) {
+        return 0;
+    }
+    if (!files || !snapshots) {
+        return CBM_NOT_FOUND;
+    }
+    int kept = 0;
+    for (int i = 0; i < *file_count; i++) {
+        if (files[i].language == CBM_LANG_COUNT) {
+            if (!cbm_pipeline_path_is_auxiliary(p, files[i].rel_path) &&
+                add_tracked_discovery_exclusion(p, files[i].rel_path) != 0) {
+                return CBM_NOT_FOUND;
+            }
+            free(files[i].path);
+            free(files[i].rel_path);
+            memset(&files[i], 0, sizeof(files[i]));
+            continue;
+        }
+        if (kept != i) {
+            files[kept] = files[i];
+            snapshots[kept] = snapshots[i];
+            memset(&files[i], 0, sizeof(files[i]));
+            memset(&snapshots[i], 0, sizeof(snapshots[i]));
+        }
+        kept++;
+    }
+    *file_count = kept;
+    return 0;
+}
+
+int cbm_pipeline_capture_file_snapshots(cbm_pipeline_t *p,
+                                        cbm_file_info_t *files, int file_count,
+                                        cbm_file_snapshot_t **out) {
+    if (!p || !out || file_count < 0 || (file_count > 0 && !files)) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    if (file_count == 0) {
+        return 0;
+    }
+    cbm_file_snapshot_t *snapshots =
+        (cbm_file_snapshot_t *)calloc((size_t)file_count, sizeof(*snapshots));
+    if (!snapshots) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (capture_one_file_snapshot(p, &files[i], &snapshots[i]) != 0) {
+            free(snapshots);
+            return CBM_NOT_FOUND;
+        }
+    }
+    *out = snapshots;
+    return 0;
+}
+
+int cbm_pipeline_verify_file_snapshots(const cbm_pipeline_t *p,
+                                       const cbm_file_info_t *files, int file_count,
+                                       cbm_file_snapshot_t *snapshots) {
+    if (!p || file_count < 0 || (file_count > 0 && (!files || !snapshots))) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        cbm_file_snapshot_t final_snapshot = {0};
+        int capture_rc = CBM_NOT_FOUND;
+        if (p->git_tracked_only && p->trusted_root && files[i].rel_path) {
+            unsigned char *bytes = NULL;
+            size_t byte_count = 0;
+            struct stat status;
+            long configured_limit = cbm_max_file_bytes();
+            size_t max_bytes =
+                configured_limit > 0 ? (size_t)configured_limit : SIZE_MAX;
+            if (cbm_trusted_root_read_file(p->trusted_root, files[i].rel_path, max_bytes,
+                                           &bytes, &byte_count, &status) == 0) {
+                cbm_sha256_hex(bytes, byte_count, final_snapshot.sha256);
+                final_snapshot.mtime_ns = stat_mtime_ns(&status);
+                final_snapshot.size = (int64_t)byte_count;
+                capture_rc = 0;
+            }
+            free(bytes);
+        } else {
+            struct stat before;
+            struct stat after;
+            if (portable_file_stat(files[i].path, &before) == 0 &&
+                cbm_sha256_file(files[i].path, final_snapshot.sha256) == 0 &&
+                portable_file_stat(files[i].path, &after) == 0 &&
+                stat_mtime_ns(&before) == stat_mtime_ns(&after) &&
+                before.st_size == after.st_size) {
+                final_snapshot.mtime_ns = stat_mtime_ns(&after);
+                final_snapshot.size = after.st_size;
+                capture_rc = 0;
+            }
+        }
+        if (capture_rc != 0 ||
+            strcmp(final_snapshot.sha256, snapshots[i].sha256) != 0) {
+            cbm_log_error("pipeline.snapshot", "status", "content_changed_during_index",
+                          "rel_path", files[i].rel_path ? files[i].rel_path : "");
+            return CBM_NOT_FOUND;
+        }
+        /* Content is identical to the pre-extraction digest. Refresh only
+         * metadata so a harmless touch during indexing does not force the
+         * next run to reparse the file. */
+        snapshots[i].mtime_ns = final_snapshot.mtime_ns;
+        snapshots[i].size = final_snapshot.size;
+    }
+    return 0;
+}
+
+static int verify_captured_parser_snapshots(const cbm_pipeline_t *p,
+                                            const cbm_file_info_t *files, int file_count,
+                                            const cbm_file_snapshot_t *snapshots) {
+    if (!p || file_count < 0 || (file_count > 0 && (!files || !snapshots))) {
+        return CBM_NOT_FOUND;
+    }
+    if (!p->git_tracked_only || p->trusted_validation_only) {
+        return 0;
+    }
+    if (file_count == 0) {
+        return 0;
+    }
+    if (!trusted_snapshot_dir_matches(p)) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        char digest[CBM_SHA256_HEX_LEN + 1];
+        if (!files[i].path || cbm_sha256_file(files[i].path, digest) != 0 ||
+            strcmp(digest, snapshots[i].sha256) != 0) {
+            cbm_log_error("pipeline.snapshot", "status", "captured_bytes_changed",
+                          "rel_path", files[i].rel_path ? files[i].rel_path : "");
+            return CBM_NOT_FOUND;
+        }
+    }
+    return 0;
+}
+
 static const char *pipeline_mode_name(cbm_index_mode_t mode) {
     switch (mode) {
     case CBM_MODE_FULL:
@@ -1238,8 +2868,21 @@ static const char *pipeline_mode_name(cbm_index_mode_t mode) {
 
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
 static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
-                                   struct timespec *t) {
+                                   cbm_file_snapshot_t *snapshots, struct timespec *t) {
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    if (p->git_tracked_only &&
+        (!pipeline_recipe_unchanged(p) ||
+         cbm_pipeline_verify_git_snapshot(p) != 0 ||
+         verify_captured_parser_snapshots(p, files, file_count, snapshots) != 0 ||
+         verify_captured_parser_snapshots(p, p->auxiliary_files,
+                                          p->auxiliary_file_count,
+                                          p->auxiliary_snapshots) != 0 ||
+         cbm_pipeline_verify_file_snapshots(p, files, file_count, snapshots) != 0 ||
+         cbm_pipeline_verify_file_snapshots(
+             p, p->auxiliary_files, p->auxiliary_file_count, p->auxiliary_snapshots) != 0)) {
+        cbm_log_error("pipeline.err", "phase", "snapshot_verify");
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_NOT_FOUND;
@@ -1284,8 +2927,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         free(db_path);
         return CBM_NOT_FOUND;
     }
+    bool hash_records_complete = true;
+    bool trust_persist_ok = true;
     {
-        bool hash_records_complete = true;
         CBM_PROF_START(t_delhash);
         if (cbm_store_delete_file_hashes(hash_store, p->project_name) != CBM_STORE_OK) {
             hash_records_complete = false;
@@ -1298,32 +2942,73 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         if (p->saved_adr) {
             if (cbm_store_adr_store(hash_store, p->project_name, p->saved_adr) != CBM_STORE_OK) {
                 cbm_log_error("pipeline.err", "phase", "adr_restore", "project", p->project_name);
+                if (p->git_tracked_only) {
+                    trust_persist_ok = false;
+                }
             }
         }
         CBM_PROF_END("persist", "3_adr_restore", t_adr);
 
-        /* Batch the per-file hash upserts into ONE transaction. The per-file
-         * cbm_store_upsert_file_hash path autocommits, i.e. file_count fsyncs
-         * (~89k on the kernel); cbm_store_upsert_file_hash_batch wraps the same
-         * cached INSERT ... ON CONFLICT upsert in a single begin/commit. Same
-         * (project, rel_path, sha256="", mtime_ns, size) tuples, same replace
-         * semantics — only the transaction boundary changes. */
+        /* Batch file-state rows into one transaction. Default mode retains
+         * the legacy mtime/size + empty-digest contract. Trust mode persists
+         * the verified pre-extraction SHA for sources plus graph-shaping
+         * auxiliary inputs (tracked manifests/tsconfig). */
         CBM_PROF_START(t_fh);
+        int hash_capacity = file_count + (p->git_tracked_only ? p->auxiliary_file_count : 0);
+        CBMHashTable *source_paths = NULL;
+        bool source_paths_ready = true;
+        if (p->git_tracked_only && p->auxiliary_file_count > 0) {
+            source_paths = cbm_ht_create(file_count > 0
+                                             ? (uint32_t)file_count * PAIR_LEN
+                                             : CBM_SZ_64);
+            source_paths_ready = source_paths != NULL;
+            for (int i = 0; source_paths_ready && i < file_count; i++) {
+                cbm_ht_set(source_paths, files[i].rel_path, p);
+            }
+            source_paths_ready =
+                source_paths_ready && (int)cbm_ht_count(source_paths) == file_count;
+            if (!source_paths_ready) {
+                hash_records_complete = false;
+                trust_persist_ok = false;
+            }
+        }
         cbm_file_hash_t *fhashes = (cbm_file_hash_t *)malloc(
-            (size_t)(file_count > 0 ? file_count : 1) * sizeof(cbm_file_hash_t));
+            (size_t)(hash_capacity > 0 ? hash_capacity : 1) * sizeof(cbm_file_hash_t));
         if (fhashes) {
             int fh_n = 0;
             for (int i = 0; i < file_count; i++) {
-                struct stat fst;
-                if (stat(files[i].path, &fst) == 0) {
+                if (p->git_tracked_only) {
                     fhashes[fh_n].project = p->project_name;
                     fhashes[fh_n].rel_path = files[i].rel_path;
-                    fhashes[fh_n].sha256 = "";
-                    fhashes[fh_n].mtime_ns = stat_mtime_ns(&fst);
-                    fhashes[fh_n].size = fst.st_size;
+                    fhashes[fh_n].sha256 = snapshots[i].sha256;
+                    fhashes[fh_n].mtime_ns = snapshots[i].mtime_ns;
+                    fhashes[fh_n].size = snapshots[i].size;
                     fh_n++;
                 } else {
-                    hash_records_complete = false;
+                    struct stat fst;
+                    if (stat(files[i].path, &fst) == 0) {
+                        fhashes[fh_n].project = p->project_name;
+                        fhashes[fh_n].rel_path = files[i].rel_path;
+                        fhashes[fh_n].sha256 = "";
+                        fhashes[fh_n].mtime_ns = stat_mtime_ns(&fst);
+                        fhashes[fh_n].size = fst.st_size;
+                        fh_n++;
+                    } else {
+                        hash_records_complete = false;
+                    }
+                }
+            }
+            if (p->git_tracked_only && source_paths_ready) {
+                for (int i = 0; i < p->auxiliary_file_count; i++) {
+                    if (cbm_ht_has(source_paths, p->auxiliary_files[i].rel_path)) {
+                        continue;
+                    }
+                    fhashes[fh_n].project = p->project_name;
+                    fhashes[fh_n].rel_path = p->auxiliary_files[i].rel_path;
+                    fhashes[fh_n].sha256 = p->auxiliary_snapshots[i].sha256;
+                    fhashes[fh_n].mtime_ns = p->auxiliary_snapshots[i].mtime_ns;
+                    fhashes[fh_n].size = p->auxiliary_snapshots[i].size;
+                    fh_n++;
                 }
             }
             if (cbm_store_upsert_file_hash_batch(hash_store, fhashes, fh_n) != CBM_STORE_OK) {
@@ -1333,21 +3018,43 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             }
             free(fhashes);
         } else {
-            /* OOM fallback: the original per-file path (identical result, slower). */
+            /* OOM fallback: identical rows via the per-file path. */
             for (int i = 0; i < file_count; i++) {
-                struct stat fst;
-                if (stat(files[i].path, &fst) == 0) {
+                if (p->git_tracked_only) {
                     if (cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path,
-                                                   "", stat_mtime_ns(&fst),
-                                                   fst.st_size) != CBM_STORE_OK) {
+                                                   snapshots[i].sha256, snapshots[i].mtime_ns,
+                                                   snapshots[i].size) != CBM_STORE_OK) {
                         hash_records_complete = false;
                     }
                 } else {
-                    hash_records_complete = false;
+                    struct stat fst;
+                    if (stat(files[i].path, &fst) == 0) {
+                        if (cbm_store_upsert_file_hash(hash_store, p->project_name,
+                                                       files[i].rel_path, "",
+                                                       stat_mtime_ns(&fst),
+                                                       fst.st_size) != CBM_STORE_OK) {
+                            hash_records_complete = false;
+                        }
+                    } else {
+                        hash_records_complete = false;
+                    }
+                }
+            }
+            if (p->git_tracked_only && source_paths_ready) {
+                for (int i = 0; i < p->auxiliary_file_count; i++) {
+                    if (!cbm_ht_has(source_paths, p->auxiliary_files[i].rel_path) &&
+                        cbm_store_upsert_file_hash(
+                            hash_store, p->project_name, p->auxiliary_files[i].rel_path,
+                            p->auxiliary_snapshots[i].sha256,
+                            p->auxiliary_snapshots[i].mtime_ns,
+                            p->auxiliary_snapshots[i].size) != CBM_STORE_OK) {
+                        hash_records_complete = false;
+                    }
                 }
             }
         }
-        CBM_PROF_END_N("persist", "4_file_hashes", t_fh, file_count);
+        cbm_ht_free(source_paths);
+        CBM_PROF_END_N("persist", "4_file_hashes", t_fh, hash_capacity);
 
         /* Coverage rows (#963): a full run's file_errors plus the by-design
          * discovery exclusions are the complete coverage truth for the
@@ -1359,7 +3066,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count;
         cbm_coverage_row_t *cov = NULL;
         int cn = 0;
-        bool coverage_rows_available = cov_total == 0;
+        bool coverage_rows_available = cov_total == 0 && !p->error_recording_failed;
         if (cov_total > 0) {
             cov = (cbm_coverage_row_t *)malloc((size_t)cov_total * sizeof(*cov));
             if (cov) {
@@ -1388,6 +3095,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_project_t project_info = {0};
         bool have_project_info =
             cbm_store_get_project(hash_store, p->project_name, &project_info) == CBM_STORE_OK;
+        if (p->git_tracked_only &&
+            (p->file_errors_count > 0 || p->error_recording_failed || !coverage_rows_available ||
+             !have_project_info || !project_info.indexed_at ||
+             p->ignored_total != p->ignored_count)) {
+            trust_persist_ok = false;
+        }
         const char *recording_status =
             !coverage_rows_available
                 ? "unavailable"
@@ -1404,6 +3117,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         if (cbm_store_coverage_replace_ex(hash_store, p->project_name, cov, cn, &coverage_meta) !=
             CBM_STORE_OK) {
             cbm_log_error("pipeline.err", "phase", "persist_coverage", "project", p->project_name);
+            if (p->git_tracked_only) {
+                trust_persist_ok = false;
+            }
         }
         free(cov);
         if (have_project_info) {
@@ -1420,14 +3136,23 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
          * Falls back to plain names if cbm_camel_split is unavailable (which
          * shouldn't happen because we always register it, but we stay defensive). */
         CBM_PROF_START(t_fts);
-        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-        if (cbm_store_exec(hash_store,
+        bool fts_ok =
+            cbm_store_exec(hash_store,
+                           "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") == CBM_STORE_OK;
+        if (fts_ok &&
+            cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
                            "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
                            "FROM nodes;") != CBM_STORE_OK) {
-            cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+            fts_ok =
+                cbm_store_exec(
+                    hash_store,
+                    "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                    "SELECT id, name, qualified_name, label, file_path FROM nodes;") ==
+                CBM_STORE_OK;
+        }
+        if (p->git_tracked_only && !fts_ok) {
+            trust_persist_ok = false;
         }
         CBM_PROF_END("persist", "5_fts_backfill", t_fts);
 
@@ -1438,11 +3163,22 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     p->saved_adr = NULL;
     free(db_path);
 
-    return 0;
+    return p->git_tracked_only && (!hash_records_complete || !trust_persist_ok)
+               ? CBM_PIPELINE_ABORT_PRESERVE_DB
+               : 0;
 }
 
 /* Run githistory pass. */
 static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+    /* The legacy history pass has a wall-clock cutoff and line-delimited
+     * filename framing, so it is not a deterministic function of the bound
+     * trusted snapshot. Strict mode deliberately omits it; this choice is
+     * pinned in the recipe fingerprint. */
+    if (p && p->git_tracked_only) {
+        cbm_log_info("pass.skip", "pass", "githistory", "reason",
+                     "trusted_snapshot_determinism");
+        return 0;
+    }
     struct timespec t_gh;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_gh);
 
@@ -1507,7 +3243,8 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 
 /* Run tests, git history, predump passes, and dump+persist. */
 static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
-                               const cbm_file_info_t *files, int file_count) {
+                               const cbm_file_info_t *files, int file_count,
+                               cbm_file_snapshot_t *snapshots) {
     int rc = run_tests_and_history(p, ctx, files, file_count);
     if (rc != 0) {
         return rc;
@@ -1520,7 +3257,7 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (!check_cancel(p)) {
         struct timespec t;
         CBM_PROF_START(t_dump);
-        rc = dump_and_persist_hashes(p, files, file_count, &t);
+        rc = dump_and_persist_hashes(p, files, file_count, snapshots, &t);
         CBM_PROF_END("pipeline", "4_dump_and_persist", t_dump);
     }
     return rc;
@@ -1534,18 +3271,18 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_struct);
-    pass_structure(p, files, file_count);
+    int rc = pass_structure(p, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
     cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
-    if (check_cancel(p)) {
+    if (rc != 0 || check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
 
     int worker_count = effective_worker_count(true);
     CBM_PROF_START(t_extract_total);
-    int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
-                 ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
-                 : run_sequential_pipeline(p, ctx, files, file_count, &t);
+    rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
+             ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
+             : run_sequential_pipeline(p, ctx, files, file_count, &t);
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
@@ -1558,11 +3295,30 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
         return CBM_NOT_FOUND;
     }
     *was_incremental = false;
+    clear_publish_snapshot(p);
+    atomic_store_explicit(&p->parser_read_failed, 0, memory_order_relaxed);
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_path_alias_collection_t *path_aliases = NULL;
+    cbm_file_snapshot_t *source_snapshots = NULL;
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    int rc = 0;
+
+    if (refresh_git_context(p) != 0) {
+        cbm_log_warn("pipeline.git_context", "status", "refresh_failed");
+        if (p->git_tracked_only) {
+            rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+            goto cleanup;
+        }
+    }
+    if (p->git_tracked_only && !pipeline_recipe_unchanged(p)) {
+        cbm_log_error("pipeline.err", "phase", "recipe_snapshot");
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        goto cleanup;
+    }
 
     /* C/C++ #define Macro nodes (#375) dominate extraction on macro-dense repos
      * (≈49% of nodes on the Linux kernel), so gate them to full mode — moderate
@@ -1571,19 +3327,22 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
 
     /* Load user-defined extension overrides (fail-open: NULL on error) */
     CBM_PROF_START(t_userconfig);
-    p->userconfig = cbm_userconfig_load(p->repo_path);
+    /* Trust mode must be a function of Git-tracked inputs only. Global and
+     * project user extension config is intentionally ignored because it is
+     * loaded before language discovery and is not part of the graph corpus. */
+    p->userconfig = p->git_tracked_only ? NULL : cbm_userconfig_load(p->repo_path);
     cbm_set_user_lang_config(p->userconfig);
     CBM_PROF_END("pipeline", "0_userconfig_load", t_userconfig);
 
-    /* Phase 1: Discover files */
+    /* Phase 1: discover files. Trust mode iterates only Git's bounded,
+     * NUL-framed manifest and never walks untracked directories. */
     CBM_PROF_START(t_discover);
     cbm_discover_opts_t opts = {
         .mode = p->mode,
         .ignore_file = NULL,
         .max_file_size = 0,
+        .trusted_git_only = p->git_tracked_only,
     };
-    cbm_file_info_t *files = NULL;
-    int file_count = 0;
     /* Capture skipped subtrees on the pipeline so the MCP layer can report
      * which directories were excluded (#411), plus the individually-ignored
      * files (#963 "purposely not indexed"). Replace any prior lists (e.g. a
@@ -1595,9 +3354,11 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     p->ignored_files = NULL;
     p->ignored_count = 0;
     p->ignored_total = 0;
-    int rc = cbm_discover_ex2(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
-                              &p->excluded_count, &p->ignored_files, &p->ignored_count,
-                              &p->ignored_total);
+    rc = p->git_tracked_only
+             ? discover_tracked_files(p, &files, &file_count)
+             : cbm_discover_ex2(p->repo_path, &opts, &files, &file_count, &p->excluded_dirs,
+                                &p->excluded_count, &p->ignored_files, &p->ignored_count,
+                                &p->ignored_total);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "discover", "rc", itoa_buf(rc));
     }
@@ -1608,14 +3369,29 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
     }
+    if (p->git_tracked_only &&
+        cbm_pipeline_capture_file_snapshots(p, files, file_count, &source_snapshots) != 0) {
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        goto cleanup;
+    }
+    if (p->git_tracked_only &&
+        finalize_trusted_source_classification(p, files, source_snapshots,
+                                               &file_count) != 0) {
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        goto cleanup;
+    }
+    if (p->git_tracked_only && !seal_trusted_snapshot_dir(p)) {
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        goto cleanup;
+    }
 
     /* Check for existing DB → try incremental or delete for reindex */
-    rc = try_incremental_or_delete_db(p, files, file_count);
+    rc = try_incremental_or_delete_db(p, files, file_count, source_snapshots);
     if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
         goto cleanup;
     }
     if (rc >= 0) {
-        *was_incremental = true;
+        *was_incremental = !p->git_tracked_only;
         goto cleanup;
     }
     cbm_log_info("pipeline.route", "path", "full");
@@ -1626,8 +3402,8 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
 
     /* Phase 2b: Load build-tool path aliases (tsconfig/jsconfig today). NULL
      * when no usable configs are found — non-TS projects pay nothing. */
-    path_aliases =
-        cbm_load_path_aliases_excluded(p->repo_path, p->excluded_dirs, p->excluded_count);
+    path_aliases = cbm_load_path_aliases_trusted(p->repo_path, p->excluded_dirs,
+                                                 p->excluded_count, p);
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {
@@ -1644,11 +3420,15 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     };
 
     rc = run_extraction_phase(p, &ctx, files, file_count);
+    if (p->git_tracked_only &&
+        atomic_load_explicit(&p->parser_read_failed, memory_order_relaxed)) {
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     if (rc != 0) {
         goto cleanup;
     }
 
-    rc = run_post_extraction(p, &ctx, files, file_count);
+    rc = run_post_extraction(p, &ctx, files, file_count, source_snapshots);
     if (rc != 0) {
         goto cleanup;
     }
@@ -1658,6 +3438,15 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
 
 cleanup:
+    if (p->git_tracked_only && rc == 0) {
+        p->publish_files = files;
+        p->publish_snapshots = source_snapshots;
+        p->publish_file_count = file_count;
+        files = NULL;
+        source_snapshots = NULL;
+        file_count = 0;
+    }
+    free(source_snapshots);
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     cbm_discover_free(files, file_count);
@@ -1826,6 +3615,27 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path, bool 
     return 0;
 }
 
+static int verify_publish_snapshot(cbm_pipeline_t *p) {
+    if (!p || !p->git_tracked_only) {
+        return 0;
+    }
+    if (atomic_load_explicit(&p->parser_read_failed, memory_order_relaxed) ||
+        !pipeline_recipe_unchanged(p) ||
+        cbm_pipeline_verify_git_snapshot(p) != 0 ||
+        verify_captured_parser_snapshots(p, p->publish_files, p->publish_file_count,
+                                         p->publish_snapshots) != 0 ||
+        verify_captured_parser_snapshots(p, p->auxiliary_files, p->auxiliary_file_count,
+                                         p->auxiliary_snapshots) != 0 ||
+        cbm_pipeline_verify_file_snapshots(p, p->publish_files, p->publish_file_count,
+                                           p->publish_snapshots) != 0 ||
+        cbm_pipeline_verify_file_snapshots(p, p->auxiliary_files, p->auxiliary_file_count,
+                                           p->auxiliary_snapshots) != 0) {
+        cbm_log_error("pipeline.err", "phase", "publish_snapshot_verify");
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
+    return 0;
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
@@ -1837,6 +3647,36 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     struct stat final_st;
     bool final_existed = stat(final_path, &final_st) == 0;
+    if (p->git_tracked_only && final_existed) {
+        cbm_store_t *published = cbm_store_open_path_query_strict(final_path);
+        bool unchanged =
+            published &&
+            cbm_pipeline_trusted_snapshot_matches_store(p->repo_path,
+                                                        p->project_name,
+                                                        published);
+        int committed_nodes = -1;
+        int committed_edges = -1;
+        if (unchanged) {
+            committed_nodes = cbm_store_count_nodes(published, p->project_name);
+            committed_edges = cbm_store_count_edges(published, p->project_name);
+            if (p->before_trusted_noop_hook) {
+                p->before_trusted_noop_hook(p, final_path,
+                                            p->before_trusted_noop_hook_ctx);
+            }
+            unchanged = committed_nodes >= 0 && committed_edges >= 0 &&
+                        cbm_store_strict_snapshot_valid(published);
+        }
+        if (unchanged) {
+            p->committed_nodes = committed_nodes;
+            p->committed_edges = committed_edges;
+        }
+        cbm_store_close(published);
+        if (unchanged) {
+            cbm_log_info("pipeline.route", "path", "trusted_snapshot_noop");
+            free(final_path);
+            return 0;
+        }
+    }
     char *staging_path = create_staging_path(final_path);
     if (!staging_path) {
         free(final_path);
@@ -1868,35 +3708,70 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     p->db_path = configured_db_path;
 
     if (rc != 0 || check_cancel(p) || seal_staging_db(staging_path) != 0) {
+        int failure_rc = rc != 0 ? rc : CBM_NOT_FOUND;
+        clear_publish_snapshot(p);
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
-        return CBM_NOT_FOUND;
+        return failure_rc;
     }
 
     if (p->before_publish_hook) {
         p->before_publish_hook(p, staging_path, p->before_publish_hook_ctx);
     }
     if (check_cancel(p)) {
+        clear_publish_snapshot(p);
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
         return CBM_NOT_FOUND;
     }
-
     /* A test hook may inspect the DB through SQLite and re-enable WAL mode;
      * seal once more before installing the standalone main file. */
     if (seal_staging_db(staging_path) != 0) {
+        clear_publish_snapshot(p);
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
         return CBM_NOT_FOUND;
     }
-
-    if (!prepare_publish_destination(final_path, final_existed, backup_succeeded) ||
-        (p->rename_hook ? p->rename_hook(staging_path, final_path, p->rename_hook_ctx)
-                        : cbm_rename_replace(staging_path, final_path)) != 0) {
+    if (p->git_tracked_only &&
+        atomic_load_explicit(&p->parser_read_failed, memory_order_relaxed)) {
+        clear_publish_snapshot(p);
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
+    if (!prepare_publish_destination(final_path, final_existed, backup_succeeded)) {
+        clear_publish_snapshot(p);
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return CBM_NOT_FOUND;
+    }
+    /* Test-only seam runs before the last seal/verification; product code owns
+     * the rename so a hook cannot mutate a source and publish it in one opaque
+     * callback. */
+    if (p->rename_hook &&
+        p->rename_hook(staging_path, final_path, p->rename_hook_ctx) != 0) {
+        clear_publish_snapshot(p);
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return CBM_NOT_FOUND;
+    }
+    if (check_cancel(p) || seal_staging_db(staging_path) != 0 ||
+        verify_publish_snapshot(p) != 0) {
+        clear_publish_snapshot(p);
+        cleanup_staging_db(staging_path);
+        free(staging_path);
+        free(final_path);
+        return CBM_NOT_FOUND;
+    }
+    if (cbm_rename_replace(staging_path, final_path) != 0) {
         cbm_log_error("pipeline.err", "phase", "publish", "path", final_path);
+        clear_publish_snapshot(p);
         cleanup_staging_db(staging_path);
         free(staging_path);
         free(final_path);
@@ -1904,6 +3779,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
 
     rc = export_after_publish(p, final_path, was_incremental);
+    clear_publish_snapshot(p);
     free(staging_path);
     free(final_path);
     return rc;

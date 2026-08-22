@@ -31,7 +31,7 @@
 
 /* Read entire file into heap-allocated buffer. Returns NULL on error.
  * Caller must free(). Sets *out_len to byte count. */
-static char *k8s_read_file(const char *path, int *out_len) {
+static char *k8s_read_file(cbm_pipeline_t *pipeline, const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
@@ -54,13 +54,14 @@ static char *k8s_read_file(const char *path, int *out_len) {
         return NULL;
     }
 
-    size_t nread = fread(buf, SKIP_ONE, size, f);
-    (void)fclose(f);
-    if (nread > (size_t)size) {
-        nread = (size_t)size;
+    if (!cbm_pipeline_fread_exact(pipeline, f, buf, (size_t)size)) {
+        (void)fclose(f);
+        free(buf);
+        return NULL;
     }
-    memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
-    *out_len = (int)nread;
+    (void)fclose(f);
+    memset(buf + size, 0, CBM_TS_LOOKAHEAD_PAD);
+    *out_len = (int)size;
     return buf;
 }
 
@@ -108,7 +109,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
     if (!res) {
         /* Fall back to re-extraction */
         int src_len = 0;
-        char *source = k8s_read_file(path, &src_len);
+        char *source = k8s_read_file(ctx->pipeline, path, &src_len);
         if (source) {
             res = cbm_extract_file(source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name, rel_path,
                                    CBM_EXTRACT_BUDGET, NULL, NULL);
@@ -652,7 +653,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
 
         if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
             int dep_len = 0;
-            char *dep_src = k8s_read_file(path, &dep_len);
+            char *dep_src = k8s_read_file(ctx->pipeline, path, &dep_len);
             if (dep_src) {
                 handle_dep_manifest(ctx, rel, dep_src,
                                     is_requirements_file(base) ? "pypi" : "gomod");
@@ -664,7 +665,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
         } else if (lang == CBM_LANG_YAML || lang == CBM_LANG_K8S) {
             /* Read source once to classify (and reuse for uncached extraction). */
             int src_len = 0;
-            char *source = k8s_read_file(path, &src_len);
+            char *source = k8s_read_file(ctx->pipeline, path, &src_len);
             if (source) {
                 if (is_helm_chart_file(base)) {
                     handle_helm_chart(ctx, rel, source);

@@ -65,10 +65,52 @@ char *cbm_strcasestr(const char *haystack, const char *needle) {
  * and GitHub's elevated runners) the directory is then born owned by
  * BUILTIN\Administrators with foreign inherited grants, and every private-
  * namespace validation (activation-transaction staging, launcher directory
- * policy) rejects the temp directory this function just made. Returns false
- * if the descriptor cannot be built or creation fails; the caller falls
- * back to plain _mkdir so degraded environments (Wine) keep working —
- * downstream validation still gates security there. */
+ * policy) rejects the temp directory this function just made. Creation is
+ * strict: the object is reopened without following reparse points and its
+ * actual owner/DACL are verified before success is reported. */
+static bool win_mkdtemp_private_handle_valid(HANDLE directory, PSID expected_user) {
+    BY_HANDLE_FILE_INFORMATION information;
+    PSID owner = NULL;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    ACL_SIZE_INFORMATION acl_information;
+    memset(&acl_information, 0, sizeof(acl_information));
+    LPVOID opaque_ace = NULL;
+
+    DWORD security_result =
+        directory != INVALID_HANDLE_VALUE
+            ? GetSecurityInfo(directory, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, NULL,
+                              &dacl, NULL, &descriptor)
+            : ERROR_INVALID_HANDLE;
+    bool valid = directory != INVALID_HANDLE_VALUE && GetFileType(directory) == FILE_TYPE_DISK &&
+                 GetFileInformationByHandle(directory, &information) != 0 &&
+                 (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                 (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+                 security_result == ERROR_SUCCESS && descriptor && owner && dacl &&
+                 IsValidSid(owner) && IsValidSid(expected_user) && EqualSid(owner, expected_user) &&
+                 GetSecurityDescriptorControl(descriptor, &control, &revision) &&
+                 (control & SE_DACL_PRESENT) != 0 && (control & SE_DACL_PROTECTED) != 0 &&
+                 GetAclInformation(dacl, &acl_information, sizeof(acl_information),
+                                   AclSizeInformation) &&
+                 acl_information.AceCount == 1 && GetAce(dacl, 0, &opaque_ace) && opaque_ace;
+    if (valid) {
+        ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)opaque_ace;
+        PSID ace_sid = (PSID)&ace->SidStart;
+        valid = ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE &&
+                ace->Header.AceSize >= sizeof(ACCESS_ALLOWED_ACE) &&
+                (ace->Header.AceFlags & (INHERITED_ACE | INHERIT_ONLY_ACE)) == 0 &&
+                IsValidSid(ace_sid) && EqualSid(ace_sid, expected_user) &&
+                (ace->Mask == FILE_ALL_ACCESS || ace->Mask == GENERIC_ALL);
+    }
+    if (descriptor) {
+        (void)LocalFree(descriptor);
+    }
+    return valid;
+}
+
 static bool win_mkdtemp_private_create(const char *path) {
     bool created = false;
     HANDLE token = NULL;
@@ -100,6 +142,21 @@ static bool win_mkdtemp_private_create(const char *path) {
             attributes.lpSecurityDescriptor = &descriptor;
             attributes.bInheritHandle = FALSE;
             created = CreateDirectoryW(wide, &attributes) != 0;
+            if (created) {
+                HANDLE directory = CreateFileW(
+                    wide, READ_CONTROL | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+                bool private_object =
+                    win_mkdtemp_private_handle_valid(directory, user->User.Sid);
+                if (directory != INVALID_HANDLE_VALUE) {
+                    (void)CloseHandle(directory);
+                }
+                if (!private_object) {
+                    (void)RemoveDirectoryW(wide);
+                    created = false;
+                }
+            }
         }
     }
     if (acl) {
@@ -114,18 +171,25 @@ static bool win_mkdtemp_private_create(const char *path) {
 }
 
 char *cbm_mkdtemp(char *tmpl) {
-    /* Build path in static buffer, then copy back to caller.
-     * Callers must provide buffers >= CBM_SZ_256 bytes (all test code does). */
-    static char buf[CBM_SZ_512];
+    /* Per-call storage: artifact exports and daemon workers may create private
+     * staging directories concurrently. A process-global scratch buffer makes
+     * their template expansion a data race and can make one caller remove or
+     * populate another caller's directory. */
+    char buf[CBM_SZ_256];
+    int written;
     if (strncmp(tmpl, "/tmp/", 5) == 0) {
         const char *tmp = getenv("TEMP");
         if (!tmp)
             tmp = getenv("TMP");
         if (!tmp)
             tmp = ".";
-        snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
+        written = snprintf(buf, sizeof(buf), "%s\\%s", tmp, tmpl + 5);
     } else {
-        snprintf(buf, sizeof(buf), "%s", tmpl);
+        written = snprintf(buf, sizeof(buf), "%s", tmpl);
+    }
+    if (written < 0 || (size_t)written >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
+        return NULL;
     }
     /* Wide-API template expansion: the ANSI CRT interprets the UTF-8 bytes of
      * non-ASCII cache/temp components in the local codepage and fails. */
@@ -138,28 +202,17 @@ char *cbm_mkdtemp(char *tmpl) {
     free(wide_template);
     if (!expanded || strlen(expanded) >= sizeof(buf)) {
         free(expanded);
+        errno = ENAMETOOLONG;
         return NULL;
     }
     strcpy(buf, expanded);
     free(expanded);
     if (!win_mkdtemp_private_create(buf)) {
-        /* One-time note: every private-namespace validation downstream
-         * depends on the explicit descriptor, so a silent fallback turns
-         * into unexplained owner/DACL refusals far from this call site. */
-        static bool fallback_reported;
-        DWORD create_error = GetLastError();
-        wchar_t *wide_directory = cbm_utf8_to_wide(buf);
-        int mkdir_result = wide_directory ? _wmkdir(wide_directory) : -1;
-        free(wide_directory);
-        if (mkdir_result != 0)
-            return NULL;
-        if (!fallback_reported) {
-            fallback_reported = true;
-            (void)fprintf(stderr,
-                          "warning: private temp-directory descriptor unavailable "
-                          "(os %lu); using default directory security\n",
-                          (unsigned long)create_error);
-        }
+        /* mkdtemp is a security boundary for staging directories. Never
+         * silently fall back to an inherited/default DACL: callers rely on
+         * success meaning owner-only creation, not merely name uniqueness. */
+        errno = EACCES;
+        return NULL;
     }
     /* Normalize to forward slashes. Callers embed this path in JSON repo_path
      * (where "\t"/"\a" are invalid escapes → index fails) and pass it to git -C.
