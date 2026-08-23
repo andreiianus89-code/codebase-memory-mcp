@@ -15,6 +15,9 @@ void cbm_trusted_root_set_before_final_open_hook_for_test(
 /* The production CreateFileW call consumes this exact flag value. */
 uint32_t cbm_trusted_root_final_open_flags_for_test(void);
 
+/* Inject transient directory-open sharing failures for the bounded retry test. */
+void cbm_trusted_root_directory_open_failures_set_for_test(unsigned int count);
+
 #endif
 
 /* Keep the final directory strict while allowing writes in pinned ancestors. */

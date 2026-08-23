@@ -842,7 +842,15 @@ TEST(trusted_root_windows_mutable_children_preserves_root_identity) {
     ASSERT_EQ(th_write_file(guard, "guard"), 0);
 
     cbm_trusted_root_t *anchor = NULL;
-    ASSERT_EQ(cbm_trusted_root_open_mutable_ancestors(root, &anchor), 0);
+    cbm_trusted_root_directory_open_failures_set_for_test(100);
+    int exhausted_result = cbm_trusted_root_open_mutable_ancestors(root, &anchor);
+    cbm_trusted_root_directory_open_failures_set_for_test(0);
+    ASSERT_NEQ(exhausted_result, 0);
+    ASSERT_NULL(anchor);
+    cbm_trusted_root_directory_open_failures_set_for_test(3);
+    int open_result = cbm_trusted_root_open_mutable_ancestors(root, &anchor);
+    cbm_trusted_root_directory_open_failures_set_for_test(0);
+    ASSERT_EQ(open_result, 0);
     ASSERT_NOT_NULL(anchor);
     wchar_t *wide_guard = cbm_path_to_wide(guard);
     ASSERT_NOT_NULL(wide_guard);
