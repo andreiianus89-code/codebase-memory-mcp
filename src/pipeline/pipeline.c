@@ -2021,6 +2021,11 @@ static bool trusted_coverage_matches(const cbm_pipeline_t *p, cbm_store_t *store
     int stored_exact = 0;
     bool matches = true;
     for (int i = 0; i < coverage_count; i++) {
+        if (coverage[i].kind && strcmp(coverage[i].kind, "parse_partial") == 0) {
+            matches = matches && coverage[i].rel_path &&
+                      cbm_pipeline_path_is_tracked(p, coverage[i].rel_path);
+            continue;
+        }
         if (!coverage[i].kind || strcmp(coverage[i].kind, "not_indexed_file") != 0 ||
             !coverage[i].rel_path || !cbm_ht_get(current, coverage[i].rel_path)) {
             matches = false;
@@ -2028,7 +2033,7 @@ static bool trusted_coverage_matches(const cbm_pipeline_t *p, cbm_store_t *store
         }
         stored_exact++;
     }
-    matches = matches && coverage_count == p->ignored_count && stored_exact == p->ignored_count;
+    matches = matches && stored_exact == p->ignored_count;
     cbm_ht_free(current);
     cbm_store_free_coverage(coverage, coverage_count);
     return matches;
@@ -2980,6 +2985,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count;
         cbm_coverage_row_t *cov = NULL;
         int cn = 0;
+        bool has_skipped_files = false;
         bool coverage_rows_available = cov_total == 0 && !p->error_recording_failed;
         if (cov_total > 0) {
             cov = (cbm_coverage_row_t *)malloc((size_t)cov_total * sizeof(*cov));
@@ -2989,6 +2995,10 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                     cov[cn].rel_path = p->file_errors[i].path;
                     cov[cn].kind = p->file_errors[i].phase;
                     cov[cn].detail = p->file_errors[i].reason;
+                    if (!p->file_errors[i].phase ||
+                        strcmp(p->file_errors[i].phase, "parse_partial") != 0) {
+                        has_skipped_files = true;
+                    }
                     cn++;
                 }
                 for (int i = 0; i < p->excluded_count; i++) {
@@ -3010,7 +3020,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         bool have_project_info =
             cbm_store_get_project(hash_store, p->project_name, &project_info) == CBM_STORE_OK;
         if (p->git_tracked_only &&
-            (p->file_errors_count > 0 || p->error_recording_failed || !coverage_rows_available ||
+            (has_skipped_files || p->error_recording_failed || !coverage_rows_available ||
              !have_project_info || !project_info.indexed_at ||
              p->ignored_total != p->ignored_count)) {
             trust_persist_ok = false;

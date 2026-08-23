@@ -6552,6 +6552,11 @@ static bool run_tracked_snapshot_integration(void) {
     TRACKED_CHECK(th_mkdir_p(path) == 0, "mkdir tools");
     snprintf(path, sizeof(path), "%s/main.go", tmpdir);
     TRACKED_CHECK(th_write_file(path, "package main\n\nfunc main() {}\n") == 0, "write main");
+    snprintf(path, sizeof(path), "%s/split.c", tmpdir);
+    TRACKED_CHECK(th_write_file(path,
+                                "void ok(void) {}\n#ifdef A\nint split(void) {\n#else\n"
+                                "int split_alt(void) {\n#endif\nreturn 1;\n}\n") == 0,
+                  "write partial parse");
     snprintf(path, sizeof(path), "%s/tools/util.go", tmpdir);
     TRACKED_CHECK(th_write_file(path, "package tools\n\nfunc Util() string { return \"u\" }\n") == 0,
                   "write tools");
@@ -6592,7 +6597,7 @@ static bool run_tracked_snapshot_integration(void) {
     snprintf(cmd, sizeof(cmd), "git -C \"%s\" init -q >%s 2>&1", tmpdir, null_dev);
     TRACKED_CHECK(run_cmd(cmd) == 0, "git init");
     snprintf(cmd, sizeof(cmd),
-             "git -C \"%s\" add main.go tools/util.go notes.cbmunsupported "
+             "git -C \"%s\" add main.go split.c tools/util.go notes.cbmunsupported "
              "config/package.json \"%s\" >%s 2>&1",
              tmpdir, deep_aux_rel, null_dev);
     TRACKED_CHECK(run_cmd(cmd) == 0, "git add");
@@ -6681,7 +6686,7 @@ static bool run_tracked_snapshot_integration(void) {
     nodes = NULL;
     TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK,
                   "load full hashes");
-    TRACKED_CHECK(hash_count == 3, "tracked hash count");
+    TRACKED_CHECK(hash_count == 4, "tracked hash count");
     const cbm_file_hash_t *main_hash =
         tracked_snapshot_find_hash(hashes, hash_count, "main.go");
     const cbm_file_hash_t *tools_hash =
@@ -6709,6 +6714,9 @@ static bool run_tracked_snapshot_integration(void) {
     TRACKED_CHECK(tracked_snapshot_find_coverage(
                       coverage, coverage_count, "notes.cbmunsupported", "not_indexed_file") != NULL,
                   "unsupported tracked path coverage");
+    TRACKED_CHECK(tracked_snapshot_find_coverage(coverage, coverage_count, "split.c",
+                                                 "parse_partial") != NULL,
+                  "partial parse remains admissible");
     int exact_exclusion_count = 0;
     for (int i = 0; i < coverage_count; i++) {
         if (coverage[i].kind && strcmp(coverage[i].kind, "not_indexed_file") == 0) {
@@ -6720,7 +6728,7 @@ static bool run_tracked_snapshot_integration(void) {
         }
     }
     /* Exact corpus invariant for this fixture:
-     * hashes(main.go, tools/util.go, package.json) U exact exclusions(notes,
+     * hashes(main.go, split.c, tools/util.go, package.json) U exact exclusions(notes,
      * depth-capped tsconfig) == git ls-files. */
     TRACKED_CHECK(exact_exclusion_count == 2, "tracked corpus exact union");
     cbm_store_free_coverage(coverage, coverage_count);
@@ -7055,7 +7063,7 @@ static bool run_tracked_snapshot_integration(void) {
     nodes = NULL;
     TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK,
                   "load detracked hashes");
-    TRACKED_CHECK(hash_count == 2 &&
+    TRACKED_CHECK(hash_count == 3 &&
                       tracked_snapshot_find_hash(hashes, hash_count, "tools/util.go") == NULL,
                   "detracked hash purged");
     cbm_store_free_file_hashes(hashes, hash_count);

@@ -112,6 +112,7 @@ static bool trusted_win_same_identity(const BY_HANDLE_FILE_INFORMATION *left,
 
 static CBM_TLS cbm_trusted_root_before_final_open_hook_fn trusted_win_before_final_open_hook;
 static CBM_TLS void *trusted_win_before_final_open_context;
+static CBM_TLS unsigned int trusted_win_directory_open_failures_for_test;
 
 void cbm_trusted_root_set_before_final_open_hook_for_test(
     cbm_trusted_root_before_final_open_hook_fn hook, void *context) {
@@ -125,6 +126,34 @@ static DWORD trusted_win_final_open_flags(void) {
 
 uint32_t cbm_trusted_root_final_open_flags_for_test(void) {
     return (uint32_t)trusted_win_final_open_flags();
+}
+
+void cbm_trusted_root_directory_open_failures_set_for_test(unsigned int count) {
+    trusted_win_directory_open_failures_for_test = count;
+}
+
+static HANDLE trusted_win_open_directory(const wchar_t *path, DWORD access, DWORD share) {
+    for (unsigned int attempt = 0; attempt < 10; attempt++) {
+        DWORD error;
+        if (trusted_win_directory_open_failures_for_test > 0) {
+            trusted_win_directory_open_failures_for_test--;
+            error = ERROR_SHARING_VIOLATION;
+        } else {
+            HANDLE handle =
+                CreateFileW(path, access, share, NULL, OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+            if (handle != INVALID_HANDLE_VALUE) {
+                return handle;
+            }
+            error = GetLastError();
+        }
+        if (error != ERROR_SHARING_VIOLATION || attempt == 9) {
+            SetLastError(error);
+            return INVALID_HANDLE_VALUE;
+        }
+        Sleep(50);
+    }
+    return INVALID_HANDLE_VALUE;
 }
 
 static void trusted_win_close_ancestors(HANDLE *handles, size_t count) {
@@ -165,9 +194,8 @@ static bool trusted_win_pin_ancestors(wchar_t *path, DWORD share, HANDLE **out_h
         }
         wchar_t saved = path[i];
         path[i] = L'\0';
-        HANDLE handle = CreateFileW(
-            path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, share, NULL, OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        HANDLE handle =
+            trusted_win_open_directory(path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, share);
         path[i] = saved;
         FILE_ATTRIBUTE_TAG_INFO tag = {0};
         bool valid =
@@ -220,9 +248,8 @@ static int trusted_win_root_open(const char *root_path, cbm_trusted_root_t **out
         free(wide);
         return CBM_NOT_FOUND;
     }
-    HANDLE handle =
-        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL,
-                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    HANDLE handle = trusted_win_open_directory(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                                               FILE_SHARE_READ);
     if (handle == INVALID_HANDLE_VALUE) {
         trusted_win_close_ancestors(ancestor_handles, ancestor_count);
         free(wide);
@@ -285,9 +312,8 @@ bool cbm_trusted_root_matches_path(const cbm_trusted_root_t *root, const char *p
     if (!wide) {
         return false;
     }
-    HANDLE handle =
-        CreateFileW(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ, NULL,
-                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    HANDLE handle = trusted_win_open_directory(wide, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                                               FILE_SHARE_READ);
     free(wide);
     if (handle == INVALID_HANDLE_VALUE) {
         return false;
@@ -334,9 +360,9 @@ int cbm_trusted_root_upgrade_mutable_children(cbm_trusted_root_t *root, const ch
     if (trusted_win_before_final_open_hook) {
         trusted_win_before_final_open_hook(trusted_win_before_final_open_context);
     }
-    HANDLE mutable = CreateFileW(root->lexical_path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    HANDLE mutable =
+        trusted_win_open_directory(root->lexical_path, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE);
     FILE_ATTRIBUTE_TAG_INFO tag = {0};
     BY_HANDLE_FILE_INFORMATION identity = {0};
     bool valid = mutable != INVALID_HANDLE_VALUE &&
