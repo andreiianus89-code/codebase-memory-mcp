@@ -3,6 +3,9 @@
 
 #include "foundation/sha256.h"
 
+#include "foundation/compat_fs.h"
+
+#include <stdio.h>
 #include <string.h>
 
 static const uint32_t K[64] = {
@@ -126,4 +129,36 @@ void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 
         out[i * 2 + 1] = hex[digest[i] & 0x0f];
     }
     out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+int cbm_sha256_file(const char *path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    if (!path || !out) {
+        return -1;
+    }
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return -1;
+    }
+
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    unsigned char buf[8192];
+    size_t n = 0;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        cbm_sha256_update(&ctx, buf, n);
+    }
+    int read_err = ferror(fp);
+    if (fclose(fp) != 0 || read_err) {
+        return -1;
+    }
+
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return 0;
 }

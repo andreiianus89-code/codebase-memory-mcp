@@ -27,4 +27,7 @@ void cbm_sha256_final(cbm_sha256_ctx *c, uint8_t out[CBM_SHA256_DIGEST_LEN]);
  * CBM_SHA256_HEX_LEN + 1 bytes (hex chars + NUL). */
 void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 1]);
 
+/* Stream a file and write its lowercase hexadecimal SHA-256 digest. */
+int cbm_sha256_file(const char *path, char out[CBM_SHA256_HEX_LEN + 1]);
+
 #endif /* CBM_SHA256_H */

@@ -171,8 +171,9 @@ static int cmp_scope_by_specificity(const void *a, const void *b) {
  * dir_prefix is the directory of the config file relative to the repo root
  * (e.g. "apps/manager", or "" for repo root). Returns NULL if the file is
  * missing, malformed, or has neither a usable paths block nor a baseUrl. */
-static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char *dir_prefix) {
-    FILE *f = cbm_fopen(abs_path, "r");
+static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char *dir_prefix,
+                                                cbm_pipeline_t *pipeline) {
+    FILE *f = cbm_fopen(abs_path, "rb");
     if (!f) {
         return NULL;
     }
@@ -188,12 +189,16 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
         fclose(f);
         return NULL;
     }
-    size_t nread = fread(buf, 1, (size_t)len, f);
+    if (!cbm_pipeline_fread_exact(pipeline, f, buf, (size_t)len)) {
+        fclose(f);
+        free(buf);
+        return NULL;
+    }
     fclose(f);
-    buf[nread] = '\0';
+    buf[len] = '\0';
 
     yyjson_read_flag flg = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_TRAILING_COMMAS;
-    yyjson_doc *doc = yyjson_read(buf, nread, flg);
+    yyjson_doc *doc = yyjson_read(buf, (size_t)len, flg);
     free(buf);
     if (!doc) {
         return NULL;
@@ -383,7 +388,7 @@ enum { TS_CONFIG_NAMES_COUNT = 2 };
 
 static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_config_hit_t *out,
                              int *count, int max_count, int depth, char **excluded_dirs,
-                             int excluded_count) {
+                             int excluded_count, const cbm_pipeline_t *pipeline) {
     if (*count >= max_count || depth > CBM_PATH_ALIAS_MAX_DEPTH) {
         return;
     }
@@ -395,7 +400,17 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
     /* One config file per directory: prefer tsconfig.json over jsconfig.json. */
     for (int i = 0; i < TS_CONFIG_NAMES_COUNT && *count < max_count; i++) {
         char check[CBM_SZ_512];
+        char config_rel[CBM_SZ_512];
         snprintf(check, sizeof(check), "%s/%s", abs_dir, TS_CONFIG_NAMES[i]);
+        if (rel_dir[0] == '\0') {
+            snprintf(config_rel, sizeof(config_rel), "%s", TS_CONFIG_NAMES[i]);
+        } else {
+            snprintf(config_rel, sizeof(config_rel), "%s/%s", rel_dir, TS_CONFIG_NAMES[i]);
+        }
+        if (pipeline && cbm_pipeline_git_tracked_only(pipeline) &&
+            !cbm_pipeline_path_is_auxiliary(pipeline, config_rel)) {
+            continue;
+        }
         FILE *f = cbm_fopen(check, "r");
         if (f) {
             fclose(f);
@@ -429,7 +444,7 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
             continue;
         }
         find_alias_files(child_abs, child_rel, out, count, max_count, depth + 1, excluded_dirs,
-                         excluded_count);
+                         excluded_count, pipeline);
     }
     cbm_closedir(d);
 }
@@ -437,8 +452,104 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
 cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
                                                             char **excluded_dirs,
                                                             int excluded_count) {
+    return cbm_load_path_aliases_trusted(repo_path, excluded_dirs, excluded_count, NULL);
+}
+
+cbm_path_alias_collection_t *cbm_load_path_aliases_trusted(const char *repo_path,
+                                                           char **excluded_dirs, int excluded_count,
+                                                           cbm_pipeline_t *pipeline) {
     if (!repo_path) {
         return NULL;
+    }
+    if (pipeline && cbm_pipeline_git_tracked_only(pipeline)) {
+        const cbm_file_info_t *auxiliary = NULL;
+        int auxiliary_count = 0;
+        cbm_pipeline_get_auxiliary_files(pipeline, &auxiliary, NULL, &auxiliary_count);
+        int config_count = 0;
+        for (int i = 0; i < auxiliary_count; i++) {
+            const char *basename =
+                auxiliary[i].rel_path ? strrchr(auxiliary[i].rel_path, '/') : NULL;
+            basename = basename ? basename + 1 : auxiliary[i].rel_path;
+            if (basename && (strcmp(basename, "tsconfig.json") == 0 ||
+                             strcmp(basename, "jsconfig.json") == 0)) {
+                config_count++;
+            }
+        }
+        if (config_count == 0) {
+            return NULL;
+        }
+        if (config_count > CBM_PATH_ALIAS_MAX_FILES) {
+            cbm_log_warn("path_alias.files.cap_hit", "repo", repo_path, "kept", "256_of_more");
+            config_count = CBM_PATH_ALIAS_MAX_FILES;
+        }
+        cbm_path_alias_collection_t *collection =
+            (cbm_path_alias_collection_t *)calloc(1, sizeof(*collection));
+        if (!collection) {
+            return NULL;
+        }
+        collection->scopes =
+            (cbm_path_alias_scope_t *)calloc((size_t)config_count, sizeof(*collection->scopes));
+        if (!collection->scopes) {
+            free(collection);
+            return NULL;
+        }
+        int considered = 0;
+        for (int i = 0; i < auxiliary_count && considered < CBM_PATH_ALIAS_MAX_FILES; i++) {
+            const char *rel_path = auxiliary[i].rel_path;
+            const char *basename = rel_path ? strrchr(rel_path, '/') : NULL;
+            basename = basename ? basename + 1 : rel_path;
+            if (!basename || (strcmp(basename, "tsconfig.json") != 0 &&
+                              strcmp(basename, "jsconfig.json") != 0)) {
+                continue;
+            }
+            size_t prefix_len = (size_t)(basename - rel_path);
+            if (prefix_len > 0) {
+                prefix_len--; /* exclude the separating slash */
+            }
+            /* Preserve historical preference for tsconfig.json when both
+             * names exist in one directory. */
+            if (strcmp(basename, "jsconfig.json") == 0) {
+                bool tsconfig_present = false;
+                for (int j = 0; j < auxiliary_count; j++) {
+                    const char *other = auxiliary[j].rel_path;
+                    size_t other_len = other ? strlen(other) : 0;
+                    static const char ts_name[] = "tsconfig.json";
+                    if (other_len == prefix_len + (prefix_len ? 1 : 0) + sizeof(ts_name) - 1 &&
+                        (!prefix_len ||
+                         (memcmp(other, rel_path, prefix_len) == 0 && other[prefix_len] == '/')) &&
+                        strcmp(other + prefix_len + (prefix_len ? 1 : 0), ts_name) == 0) {
+                        tsconfig_present = true;
+                        break;
+                    }
+                }
+                if (tsconfig_present) {
+                    continue;
+                }
+            }
+            considered++;
+            char *prefix = (char *)malloc(prefix_len + 1);
+            if (!prefix) {
+                cbm_path_alias_collection_free(collection);
+                return NULL;
+            }
+            memcpy(prefix, rel_path, prefix_len);
+            prefix[prefix_len] = '\0';
+            cbm_path_alias_map_t *map = load_tsconfig_file(auxiliary[i].path, prefix, pipeline);
+            if (!map) {
+                free(prefix);
+                continue;
+            }
+            collection->scopes[collection->count].dir_prefix = prefix;
+            collection->scopes[collection->count].map = map;
+            collection->count++;
+        }
+        if (collection->count == 0) {
+            cbm_path_alias_collection_free(collection);
+            return NULL;
+        }
+        qsort(collection->scopes, (size_t)collection->count, sizeof(*collection->scopes),
+              cmp_scope_by_specificity);
+        return collection;
     }
     alias_config_hit_t *hits = calloc(CBM_PATH_ALIAS_MAX_FILES, sizeof(*hits));
     if (!hits) {
@@ -446,7 +557,7 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
     }
     int count = 0;
     find_alias_files(repo_path, "", hits, &count, CBM_PATH_ALIAS_MAX_FILES, 0, excluded_dirs,
-                     excluded_count);
+                     excluded_count, pipeline);
     if (count >= CBM_PATH_ALIAS_MAX_FILES) {
         cbm_log_warn("path_alias.files.cap_hit", "repo", repo_path, "kept", "256_of_more");
     }
@@ -468,7 +579,7 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
     }
 
     for (int i = 0; i < count; i++) {
-        cbm_path_alias_map_t *map = load_tsconfig_file(hits[i].abs, hits[i].rel);
+        cbm_path_alias_map_t *map = load_tsconfig_file(hits[i].abs, hits[i].rel, pipeline);
         if (!map) {
             continue;
         }

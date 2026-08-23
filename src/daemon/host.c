@@ -77,6 +77,7 @@ typedef struct {
 struct host_state {
     /* Mirrors cbm_daemon_host_config_t.permanent for prepare-time consumers. */
     bool permanent;
+    bool read_only;
     cbm_daemon_application_t *application;
     cbm_watcher_t *watcher;
     cbm_store_t *watch_store;
@@ -104,6 +105,7 @@ static cbm_mutex_t g_host_log_mutex;
 static bool g_host_log_mutex_initialized = false;
 
 static _Noreturn void host_force_terminate(const char *component);
+static bool host_background_start(host_state_t *host);
 
 static void host_log_sink(const char *line) {
     cbm_ui_log_append(line);
@@ -290,14 +292,14 @@ static void *host_http_thread(void *opaque) {
 
 static int host_watcher_index(const char *project_name, const char *root_path, void *opaque) {
     host_state_t *host = opaque;
-    return host && host->application
+    return host && !host->read_only && host->application
                ? cbm_daemon_application_watcher_index(project_name, root_path, host->application)
                : -1;
 }
 
 static int host_ui_index(void *opaque, const char *root_path, const char *project_name) {
     host_state_t *host = opaque;
-    return host && host->application
+    return host && !host->read_only && host->application
                ? cbm_daemon_application_index(host->application, project_name ? project_name : "",
                                               root_path)
                : -1;
@@ -305,7 +307,7 @@ static int host_ui_index(void *opaque, const char *root_path, const char *projec
 
 static bool host_ui_mutation_begin(void *opaque, const char *project) {
     host_state_t *host = opaque;
-    return host && host->application &&
+    return host && !host->read_only && host->application &&
            cbm_daemon_application_project_mutation_try_begin(host->application, project);
 }
 
@@ -426,7 +428,7 @@ static void host_http_schedule_retry(host_state_t *host, uint64_t now_ms, const 
 }
 
 static void host_http_reconcile_at(host_state_t *host, uint64_t now_ms, bool force_config_load) {
-    if (!host || !host->http_ops) {
+    if (!host || host->read_only || !host->http_ops) {
         return;
     }
     if (!force_config_load && host->http_config_loaded && now_ms < host->http_next_config_load_ms) {
@@ -562,23 +564,27 @@ static void host_state_free(host_state_t *host) {
 static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint_t *endpoint) {
     host->http_ops = &g_host_http_default_ops;
     host->http_assets_available = CBM_EMBEDDED_FILE_COUNT > 0;
+    host->read_only = cbm_env_enabled("CBM_READ_ONLY");
     size_t aggregate_memory_budget_bytes = cbm_mem_budget();
     const char *cache = cbm_resolve_cache_dir();
     if (!cache || !cache[0]) {
         cbm_log_error("daemon.runtime_config_open_failed", "reason", "cache_dir_unavailable");
         return false;
     }
-    host->runtime_config = cbm_config_open(cache);
-    if (!host->runtime_config) {
-        cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
-        return false;
+    if (!host->read_only) {
+        host->runtime_config = cbm_config_open(cache);
+        if (!host->runtime_config) {
+            cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
+            return false;
+        }
+        host->watch_store = cbm_store_open_memory();
+        host->project_locks = cbm_project_lock_manager_new(endpoint);
+        host->watcher = cbm_watcher_new(host->watch_store, host_watcher_index, host);
     }
-    host->watch_store = cbm_store_open_memory();
-    host->project_locks = cbm_project_lock_manager_new(endpoint);
-    host->watcher = cbm_watcher_new(host->watch_store, host_watcher_index, host);
     cbm_daemon_application_config_t application_config = {
         .watcher = host->watcher,
         .config = host->runtime_config,
+        .read_only = host->read_only,
         .aggregate_memory_budget_bytes = aggregate_memory_budget_bytes,
         .project_locks = host->project_locks,
     };
@@ -586,7 +592,8 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
     if (host->application && host->permanent) {
         cbm_daemon_application_set_permanent(host->application, true);
     }
-    if (!host->watch_store || !host->watcher || !host->project_locks || !host->application) {
+    if (!host->application ||
+        (!host->read_only && (!host->watch_store || !host->watcher || !host->project_locks))) {
         return false;
     }
     return true;
@@ -600,6 +607,29 @@ bool cbm_daemon_host_state_prepare_for_test(const cbm_daemon_ipc_endpoint_t *end
     bool prepared = host_state_prepare(&host, endpoint);
     host_state_free(&host);
     return prepared;
+}
+
+bool cbm_daemon_host_read_only_startup_probe_for_test(
+    const cbm_daemon_ipc_endpoint_t *endpoint,
+    cbm_daemon_host_read_only_probe_result_t *result_out) {
+    if (!endpoint || !result_out) {
+        return false;
+    }
+    memset(result_out, 0, sizeof(*result_out));
+    host_state_t host = {0};
+    bool prepared = host_state_prepare(&host, endpoint);
+    bool background_started = prepared && host_background_start(&host);
+    result_out->read_only = host.read_only;
+    result_out->application_created = host.application != NULL;
+    result_out->runtime_config_opened = host.runtime_config != NULL;
+    result_out->watch_store_opened = host.watch_store != NULL;
+    result_out->project_locks_created = host.project_locks != NULL;
+    result_out->watcher_created = host.watcher != NULL;
+    result_out->watcher_thread_started = host.watcher_started;
+    result_out->http_server_created = host.http != NULL;
+    result_out->http_thread_started = host.http_started;
+    host_state_free(&host);
+    return prepared && background_started;
 }
 
 typedef struct {
@@ -812,6 +842,9 @@ bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void) {
 }
 
 static bool host_background_start(host_state_t *host) {
+    if (host->read_only) {
+        return true;
+    }
     if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
         return false;
     }

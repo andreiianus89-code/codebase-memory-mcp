@@ -1009,22 +1009,7 @@ static bool has_matlab_line_markers(const char *buf) {
     return false;
 }
 
-CBMLanguage cbm_disambiguate_m(const char *path) {
-    if (!path) {
-        return CBM_LANG_MATLAB;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_MATLAB;
-    }
-
-    /* Read first 4KB */
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage disambiguate_m_buffer(const char *buf) {
     if (has_objc_markers(buf)) {
         return CBM_LANG_OBJC;
     }
@@ -1042,24 +1027,34 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     return CBM_LANG_MATLAB;
 }
 
+CBMLanguage cbm_disambiguate_m_bytes(const unsigned char *bytes, size_t len) {
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t copy_len = len < CBM_SZ_4K ? len : CBM_SZ_4K;
+    if (copy_len > 0 && bytes) {
+        memcpy(buf, bytes, copy_len);
+    }
+    buf[copy_len] = '\0';
+    return disambiguate_m_buffer(buf);
+}
+
+CBMLanguage cbm_disambiguate_m(const char *path) {
+    if (!path) {
+        return CBM_LANG_MATLAB;
+    }
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_MATLAB;
+    }
+    unsigned char buf[CBM_SZ_4K];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    (void)fclose(f);
+    return cbm_disambiguate_m_bytes(buf, n);
+}
+
 /* Disambiguate .cls files: shared by InterSystems ObjectScript UDL and
  * Salesforce Apex. ObjectScript class files begin with a line of the form
  * "Class <UppercasePackage>...". Defaults to Apex on any doubt. */
-CBMLanguage cbm_disambiguate_cls(const char *path) {
-    if (!path) {
-        return CBM_LANG_APEX;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_APEX;
-    }
-
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage disambiguate_cls_buffer(const char *buf) {
     const char *line = buf;
     while (*line) {
         if (strncmp(line, "Class ", SLEN("Class ")) == 0 &&
@@ -1075,6 +1070,30 @@ CBMLanguage cbm_disambiguate_cls(const char *path) {
     return CBM_LANG_APEX;
 }
 
+CBMLanguage cbm_disambiguate_cls_bytes(const unsigned char *bytes, size_t len) {
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t copy_len = len < CBM_SZ_4K ? len : CBM_SZ_4K;
+    if (copy_len > 0 && bytes) {
+        memcpy(buf, bytes, copy_len);
+    }
+    buf[copy_len] = '\0';
+    return disambiguate_cls_buffer(buf);
+}
+
+CBMLanguage cbm_disambiguate_cls(const char *path) {
+    if (!path) {
+        return CBM_LANG_APEX;
+    }
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_APEX;
+    }
+    unsigned char buf[CBM_SZ_4K];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    (void)fclose(f);
+    return cbm_disambiguate_cls_bytes(buf, n);
+}
+
 /* Disambiguate .inc files: shared by BitBake include fragments and
  * InterSystems ObjectScript include (macro) files. ObjectScript .inc files are
  * predominantly macro definitions ("#define NAME ..." / "#def1arg NAME ...");
@@ -1084,21 +1103,7 @@ CBMLanguage cbm_disambiguate_cls(const char *path) {
  * We therefore match ObjectScript preprocessor directives ('#' immediately
  * followed by 'def'/';'), which BitBake never produces. Defaults to BitBake on
  * any doubt (preserves existing behaviour). */
-CBMLanguage cbm_disambiguate_inc(const char *path) {
-    if (!path) {
-        return CBM_LANG_BITBAKE;
-    }
-
-    FILE *f = cbm_fopen(path, "r");
-    if (!f) {
-        return CBM_LANG_BITBAKE;
-    }
-
-    char buf[CBM_SZ_4K + SKIP_ONE];
-    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
-    buf[n] = '\0';
-    (void)fclose(f);
-
+static CBMLanguage disambiguate_inc_buffer(const char *buf) {
     const char *line = buf;
     while (*line) {
         /* ObjectScript include header: a line beginning "ROUTINE <Uppercase>". */
@@ -1121,4 +1126,28 @@ CBMLanguage cbm_disambiguate_inc(const char *path) {
         line = nl + SKIP_ONE;
     }
     return CBM_LANG_BITBAKE;
+}
+
+CBMLanguage cbm_disambiguate_inc_bytes(const unsigned char *bytes, size_t len) {
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t copy_len = len < CBM_SZ_4K ? len : CBM_SZ_4K;
+    if (copy_len > 0 && bytes) {
+        memcpy(buf, bytes, copy_len);
+    }
+    buf[copy_len] = '\0';
+    return disambiguate_inc_buffer(buf);
+}
+
+CBMLanguage cbm_disambiguate_inc(const char *path) {
+    if (!path) {
+        return CBM_LANG_BITBAKE;
+    }
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_BITBAKE;
+    }
+    unsigned char buf[CBM_SZ_4K];
+    size_t n = fread(buf, SKIP_ONE, sizeof(buf), f);
+    (void)fclose(f);
+    return cbm_disambiguate_inc_bytes(buf, n);
 }

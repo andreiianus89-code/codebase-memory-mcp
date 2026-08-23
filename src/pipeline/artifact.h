@@ -11,12 +11,15 @@
 
 #include <stdbool.h>
 
-/* Schema version — increment when DB schema changes (new tables/indexes).
- * Import refuses artifacts with schema_version > current.
+/* Schema version — increment when DB schema or bundle contract changes.
+ * Import requires the exact current schema version.
  * v2: edges uniqueness widened to (source_id, target_id, type,
  *     local_name_gen) so sibling named imports coexist (#768) — old
- *     binaries cannot upsert against the widened constraint. */
-#define CBM_ARTIFACT_SCHEMA_VERSION 2
+ *     binaries cannot upsert against the widened constraint.
+ * v3: artifact.json cryptographically binds compressed_size and the
+ *     graph.db.zst SHA-256 so the two-file bundle fails closed after a torn
+ *     or mixed-generation publication. */
+#define CBM_ARTIFACT_SCHEMA_VERSION 3
 
 #define CBM_ARTIFACT_FILENAME "graph.db.zst"
 #define CBM_ARTIFACT_META "artifact.json"

@@ -435,6 +435,12 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
     return NULL;
 }
 
+bool cbm_env_enabled(const char *name) {
+    char value[CBM_SZ_16];
+    const char *configured = cbm_safe_getenv(name, value, sizeof(value), "");
+    return configured && (strcmp(configured, "1") == 0 || strcmp(configured, "true") == 0);
+}
+
 /* ── Home directory (cross-platform) ───────────────────── */
 
 const char *cbm_get_home_dir(void) {

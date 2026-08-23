@@ -168,6 +168,7 @@ struct cbm_daemon_application {
     cbm_mutex_t mutex;
     struct cbm_watcher *watcher;
     struct cbm_config *config;
+    bool read_only;
     cbm_daemon_application_session_t *sessions;
     cbm_daemon_application_watch_t *watches;
     cbm_daemon_application_job_t *jobs;
@@ -427,7 +428,7 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
 /* Caller holds application->mutex. */
 static void application_refresh_watch_locked(cbm_daemon_application_session_t *session) {
     cbm_daemon_application_t *application = session->application;
-    if (!application->watcher || !session->context_set ||
+    if (application->read_only || !application->watcher || !session->context_set ||
         session->tool_profile != CBM_MCP_TOOL_PROFILE_ALL || session->hook_event ||
         session->hook_dialect || session->auto_index_subscribed) {
         return;
@@ -847,7 +848,7 @@ static bool application_job_reserves_project_locked(cbm_daemon_application_t *ap
 static bool application_mutation_begin_internal(cbm_daemon_application_t *application,
                                                 cbm_daemon_application_session_t *session,
                                                 const char *project_key, bool wait) {
-    if (!application || !project_key || !project_key[0]) {
+    if (!application || application->read_only || !project_key || !project_key[0]) {
         return false;
     }
     cbm_daemon_application_mutation_t *reserved = NULL;
@@ -1368,7 +1369,7 @@ static void application_job_recover(cbm_daemon_application_job_t *job,
  * at that same boundary so an otherwise-idle MCP session does not need to send
  * another request merely to make background progress. Caller holds mutex. */
 static void application_auto_index_retry_pending_locked(cbm_daemon_application_t *application) {
-    if (application->stopping) {
+    if (application->read_only || application->stopping) {
         return;
     }
     for (cbm_daemon_application_session_t *session = application->sessions; session;
@@ -1572,7 +1573,7 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
     const char *args_json, application_job_subscribe_status_t *status_out) {
     *status_out = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
-    if (application->stopping) {
+    if (application->read_only || application->stopping) {
         return NULL;
     }
     cbm_daemon_application_job_t *job =
@@ -1820,7 +1821,7 @@ static void application_update_subscribe_locked(cbm_daemon_application_session_t
      * network request by default" a structural property rather than a promise:
      * with update_ops empty nothing is ever started, so no session can observe
      * a generation, become its owner, or wait on it. */
-    if (!application->update_ops.start) {
+    if (application->read_only || !application->update_ops.start) {
         return;
     }
     if (application->update_generation_started) {
@@ -1911,6 +1912,9 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
         return;
     }
     cbm_daemon_application_t *application = session->application;
+    if (application->read_only) {
+        return;
+    }
     const char *project = cbm_mcp_server_session_project(session->mcp);
     const char *root_path = cbm_mcp_server_session_root(session->mcp);
     if (!project || !project[0] || !root_path || !root_path[0]) {
@@ -2236,7 +2240,12 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
         return NULL;
     }
     session->mcp = cbm_mcp_server_new(NULL);
-    if (!session->mcp || !cbm_mcp_server_release_pristine_memory_store(session->mcp)) {
+    if (!session->mcp) {
+        free(session);
+        return NULL;
+    }
+    cbm_mcp_server_set_read_only(session->mcp, application->read_only);
+    if (!cbm_mcp_server_release_pristine_memory_store(session->mcp)) {
         cbm_mcp_server_free(session->mcp);
         free(session);
         return NULL;
@@ -2350,7 +2359,8 @@ static cbm_daemon_runtime_application_status_t application_mcp_request(
         parsed_ok && parsed.has_id && parsed.method && strcmp(parsed.method, "tools/call") == 0;
     char *response = cbm_mcp_server_handle(session->mcp, message);
     free(message);
-    if (initialize_request && application_jsonrpc_success(response)) {
+    if (initialize_request && !session->application->read_only &&
+        application_jsonrpc_success(response)) {
         cbm_mutex_lock(&session->application->mutex);
         session->pending_background_initialize = true;
         cbm_mutex_unlock(&session->application->mutex);
@@ -2414,7 +2424,8 @@ static cbm_daemon_runtime_application_status_t application_set_ui_config(
     const uint8_t *request, uint32_t request_length) {
     const uint8_t valid_mask =
         CBM_DAEMON_APPLICATION_UI_CONFIG_ENABLED | CBM_DAEMON_APPLICATION_UI_CONFIG_PORT;
-    if (!session || !session->context_set || session->tool_profile != CBM_MCP_TOOL_PROFILE_ALL ||
+    if (!application || application->read_only || !session || !session->context_set ||
+        session->tool_profile != CBM_MCP_TOOL_PROFILE_ALL ||
         request_length != APPLICATION_UI_CONFIG_REQUEST_SIZE) {
         return CBM_DAEMON_RUNTIME_APPLICATION_REJECTED;
     }
@@ -2553,7 +2564,7 @@ static cbm_daemon_runtime_application_status_t application_request(
         session->request_cancel_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
     }
     bool activate_background =
-        !cancelled && status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+        !application->read_only && !cancelled && status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
         (session->pending_background_initialize ||
          (session->background_eligible &&
           (session->auto_index_retry_pending ||
@@ -2736,6 +2747,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     if (config) {
         application->watcher = config->watcher;
         application->config = config->config;
+        application->read_only = config->read_only;
         application->project_locks = config->project_locks;
         if (config->physical_job_limit > 0) {
             application->physical_job_limit = config->physical_job_limit;
@@ -2749,6 +2761,13 @@ cbm_daemon_application_t *cbm_daemon_application_new(
         if (config->update_ops) {
             application->update_ops = *config->update_ops;
         }
+    }
+    application->read_only = application->read_only || cbm_env_enabled("CBM_READ_ONLY");
+    if (application->read_only) {
+        application->watcher = NULL;
+        application->config = NULL;
+        application->project_locks = NULL;
+        application->physical_job_limit = 0;
     }
     /* Equal fixed slices keep admission deterministic: starting fewer jobs does
      * not let an early worker claim memory reserved for later concurrent jobs.
@@ -3168,7 +3187,7 @@ cbm_daemon_runtime_application_status_t cbm_daemon_application_client_hook_augme
 static int application_background_index(cbm_daemon_application_t *application,
                                         const char *project_name, const char *root_path,
                                         bool require_live_watch) {
-    if (!application || !project_name || !root_path) {
+    if (!application || application->read_only || !project_name || !root_path) {
         return -1;
     }
     char canonical_root[APPLICATION_PATH_CAP];

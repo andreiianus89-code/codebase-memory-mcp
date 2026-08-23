@@ -1,5 +1,17 @@
 #include "scope.h"
+#include <stdlib.h>
 #include <string.h>
+
+_Atomic int cbm_lsp_walk_depth_effective = -1;
+
+int cbm_lsp_configure_max_walk_depth(void) {
+    const char* e = getenv("CBM_LSP_MAX_WALK_DEPTH");
+    int v = (e && *e) ? atoi(e) : 0;
+    int effective = v > 0 ? v : CBM_LSP_MAX_WALK_DEPTH;
+    atomic_store_explicit(&cbm_lsp_walk_depth_effective, effective,
+                          memory_order_relaxed);
+    return effective;
+}
 
 CBMScope* cbm_scope_push(CBMArena* a, CBMScope* current) {
     CBMScope* scope = (CBMScope*)cbm_arena_alloc(a, sizeof(CBMScope));

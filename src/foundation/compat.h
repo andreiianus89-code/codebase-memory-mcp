@@ -204,9 +204,9 @@ static inline int cbm_unsetenv(const char *name) {
 static inline const char *cbm_tmpdir(void) {
 #ifdef _WIN32
     const char *t = getenv("TEMP");
-    if (!t)
+    if (!t || !t[0])
         t = getenv("TMP");
-    return t ? t : ".";
+    return t && t[0] ? t : ".";
 #else
     return "/tmp";
 #endif

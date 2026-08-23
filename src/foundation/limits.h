@@ -17,6 +17,7 @@ typedef enum {
     CBM_READ_EMPTY,     /* zero/negative size — benign, nothing to index */
     CBM_READ_OVERSIZED, /* size exceeds cbm_max_file_bytes() */
     CBM_READ_OOM,       /* buffer allocation failed */
+    CBM_READ_SHORT,     /* fewer bytes read than the measured file size */
 } cbm_read_status_t;
 
 /* Maximum size (bytes) of a single source file the indexer will read into

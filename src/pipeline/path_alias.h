@@ -28,6 +28,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+struct cbm_pipeline;
+
 /* Single alias entry: prefix-pattern → target-pattern, optionally with a
  * single '*' wildcard. The pattern is split at the wildcard so resolution
  * can match the prefix/suffix and slot the wildcard portion into the
@@ -75,6 +77,9 @@ cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path);
 cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
                                                             char **excluded_dirs,
                                                             int excluded_count);
+cbm_path_alias_collection_t *cbm_load_path_aliases_trusted(const char *repo_path,
+                                                           char **excluded_dirs, int excluded_count,
+                                                           struct cbm_pipeline *pipeline);
 
 /* Free a collection produced by cbm_load_path_aliases. NULL-safe. */
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll);

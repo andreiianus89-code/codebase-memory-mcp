@@ -6,7 +6,7 @@
 
 // Zstd compression at specified level (1=fast .. 22=best).
 // Returns compressed size on success, 0 on error.
-int cbm_zstd_compress(const char *src, int srcLen, char *dst, int dstCap, int level);
+size_t cbm_zstd_compress(const char *src, size_t srcLen, char *dst, size_t dstCap, int level);
 
 // Zstd decompression. srcLen/dstCap are size_t so a >2 GiB destination capacity
 // is never truncated (a large DB artifact, or a crafted one, would otherwise
@@ -20,6 +20,6 @@ int64_t cbm_zstd_decompress(const char *src, size_t srcLen, char *dst, size_t ds
 size_t cbm_zstd_frame_content_size(const char *src, size_t srcLen);
 
 // Maximum compressed size bound for given input size.
-size_t cbm_zstd_compress_bound(int inputSize);
+size_t cbm_zstd_compress_bound(size_t inputSize);
 
 #endif // CBM_ZSTD_STORE_H

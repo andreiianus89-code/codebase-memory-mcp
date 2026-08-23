@@ -648,7 +648,7 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
 }
 
 /* Detect language for a file, handling .m disambiguation and JSON filtering. */
-static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
+CBMLanguage cbm_discover_detect_file_language(const char *entry_name, const char *abs_path) {
     CBMLanguage lang = cbm_language_for_filename(entry_name);
     if (lang == CBM_LANG_COUNT) {
         return CBM_LANG_COUNT;
@@ -681,6 +681,37 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
         }
     }
     /* Check ignored JSON files */
+    if (lang == CBM_LANG_JSON && str_in_list(entry_name, IGNORED_JSON_FILES)) {
+        return CBM_LANG_COUNT;
+    }
+    return lang;
+}
+
+CBMLanguage cbm_discover_detect_file_language_bytes(const char *entry_name,
+                                                    const unsigned char *bytes, size_t len) {
+    CBMLanguage lang = cbm_language_for_filename(entry_name);
+    if (lang == CBM_LANG_COUNT) {
+        return CBM_LANG_COUNT;
+    }
+    const char *dot = strrchr(entry_name, '.');
+    if (dot && strcmp(dot, ".m") == 0) {
+        lang = cbm_disambiguate_m_bytes(bytes, len);
+    } else if (dot && strcmp(dot, ".cls") == 0) {
+        lang = cbm_disambiguate_cls_bytes(bytes, len);
+    } else if (dot && strcmp(dot, ".inc") == 0) {
+        lang = cbm_disambiguate_inc_bytes(bytes, len);
+    }
+    if (lang == CBM_LANG_XML) {
+        size_t prefix_len = len < CBM_SZ_256 - 1 ? len : CBM_SZ_256 - 1;
+        char prefix[CBM_SZ_256];
+        if (prefix_len > 0 && bytes) {
+            memcpy(prefix, bytes, prefix_len);
+        }
+        prefix[prefix_len] = '\0';
+        if (strstr(prefix, "<Export generator=")) {
+            lang = CBM_LANG_OBJECTSCRIPT_EXPORT;
+        }
+    }
     if (lang == CBM_LANG_JSON && str_in_list(entry_name, IGNORED_JSON_FILES)) {
         return CBM_LANG_COUNT;
     }
@@ -751,7 +782,7 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
         file_list_add_ignored(out, rel_path, skip_reason);
         return;
     }
-    CBMLanguage lang = detect_file_language(name, abs_path);
+    CBMLanguage lang = cbm_discover_detect_file_language(name, abs_path);
     if (lang == CBM_LANG_COUNT) {
         return;
     }
@@ -777,8 +808,9 @@ typedef struct {
 } walk_stack_t;
 /* Build abs/rel paths and process one directory entry. */
 /* Try to load a nested .gitignore from this directory. Returns owned pointer or NULL. */
-static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
-    if (frame->local_gi || frame->prefix[0] == '\0') {
+static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame,
+                                                  const cbm_discover_opts_t *opts) {
+    if ((opts && opts->trusted_git_only) || frame->local_gi || frame->prefix[0] == '\0') {
         return NULL;
     }
     char gi_path[CBM_SZ_4K];
@@ -915,7 +947,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
     while (ws.top > 0 && !file_list_should_stop(out)) {
         walk_frame_t frame = ws.frames[--ws.top];
 
-        cbm_gitignore_t *loaded = try_load_nested_gitignore(&frame);
+        cbm_gitignore_t *loaded = try_load_nested_gitignore(&frame, opts);
         if (loaded) {
             int local_prefix_length =
                 snprintf(frame.local_gi_prefix, sizeof(frame.local_gi_prefix), "%s", frame.prefix);
@@ -1120,9 +1152,12 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     /* Always honour the .gitignore at the indexed-directory root, even when the
      * directory is not a git repo root (e.g. indexing a sub-package directly).
      * Fixes issue #510: a root .gitignore was silently ignored without .git/. */
-    snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
-    gitignore = cbm_gitignore_load(gi_path);
-    if (is_git_repo) {
+    bool trusted_git_only = opts && opts->trusted_git_only;
+    if (!trusted_git_only) {
+        snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
+        gitignore = cbm_gitignore_load(gi_path);
+    }
+    if (is_git_repo && !trusted_git_only) {
         path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
         has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
 
@@ -1143,13 +1178,16 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     }
 
     cbm_gitignore_t *global_gi = NULL;
-    if (has_git_config && resolve_global_excludes_path(gi_path, sizeof(gi_path))) {
+    if (!trusted_git_only && has_git_config &&
+        resolve_global_excludes_path(gi_path, sizeof(gi_path))) {
         global_gi = cbm_gitignore_load(gi_path);
     }
 
     /* Load cbmignore if specified or exists at repo root */
     cbm_gitignore_t *cbmignore = NULL;
-    if (opts && opts->ignore_file) {
+    if (trusted_git_only) {
+        cbmignore = NULL;
+    } else if (opts && opts->ignore_file) {
         cbmignore = cbm_gitignore_load(opts->ignore_file);
     } else {
         snprintf(gi_path, sizeof(gi_path), "%s/.cbmignore", repo_path);

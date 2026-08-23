@@ -62,6 +62,11 @@ bool cbm_daemon_rendezvous_key(char out[CBM_DAEMON_KEY_SIZE]);
 bool cbm_daemon_build_fingerprint_file(const char *path,
                                        char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 
+/* Feature compatibility tag for the process-wide serving policy. Strict and
+ * writable processes, and tracked-only versus unrestricted processes, must
+ * never share one daemon generation. */
+uint32_t cbm_daemon_policy_feature_abi(void);
+
 cbm_daemon_hello_status_t cbm_daemon_hello_compare(const cbm_daemon_build_identity_t *active,
                                                    const cbm_daemon_build_identity_t *requested,
                                                    cbm_daemon_conflict_t *conflict_out);

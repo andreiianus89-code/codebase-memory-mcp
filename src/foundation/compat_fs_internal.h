@@ -41,6 +41,9 @@ wchar_t *cbm_build_cmdline(const char *const *argv);
  */
 int cbm_popen_last_was_isolated(void);
 
+/* Inject transient MoveFileExW failures for the single-threaded retry test. */
+void cbm_rename_replace_failures_set_for_test(unsigned int count);
+
 #endif /* _WIN32 */
 
 #endif /* CBM_FOUNDATION_COMPAT_FS_INTERNAL_H */

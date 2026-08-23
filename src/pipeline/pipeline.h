@@ -28,6 +28,7 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_pipeline cbm_pipeline_t;
+typedef struct cbm_trusted_snapshot cbm_trusted_snapshot_t;
 
 /* ── Index mode ─────────────────────────────────────────────────── */
 
@@ -58,6 +59,19 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
 /* Run the full indexing pipeline. Returns 0 on success, -1 on error.
  * Discovers files, extracts, resolves, and dumps to SQLite. */
 int cbm_pipeline_run(cbm_pipeline_t *p);
+
+/* Admit one request against a Git-tracked store generation. Admission hashes
+ * every source/auxiliary input once and retains only metadata/digests. The
+ * caller must verify after the read and then free the snapshot. */
+int cbm_pipeline_trusted_snapshot_admit(const char *repo_path, const char *project,
+                                        cbm_store_t *store, cbm_trusted_snapshot_t **out);
+bool cbm_pipeline_trusted_snapshot_verify(cbm_trusted_snapshot_t *snapshot);
+void cbm_pipeline_trusted_snapshot_free(cbm_trusted_snapshot_t *snapshot);
+
+/* Convenience gate for one-shot callers such as index no-op routing. Performs
+ * admission plus final verification (two corpus reads total). */
+bool cbm_pipeline_trusted_snapshot_matches_store(const char *repo_path, const char *project,
+                                                 cbm_store_t *store);
 
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
@@ -118,7 +132,7 @@ typedef struct {
  * NOT thread-safe: call it from the sequential extraction pass, or from the
  * parallel merge step (never from inside a parallel worker — workers collect
  * into per-worker lists and merge sequentially). */
-void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+bool cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
                                  const char *phase);
 
 /* Borrowed accessor for the recorded skips (owned by the pipeline, valid until

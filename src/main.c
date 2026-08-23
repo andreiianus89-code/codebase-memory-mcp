@@ -1078,6 +1078,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
     if (!cache || !cache[0]) {
         return MAIN_BUILD_IDENTITY_CACHE_RESOLVE;
     }
+    bool read_only = cbm_env_enabled("CBM_READ_ONLY");
     /* Preserve one intentional alias spelling at the process boundary: an
      * existing directory (including a symlink supplied by the user) is
      * resolved first. Only a genuinely absent root goes through mkdir_p's
@@ -1085,7 +1086,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * only the resulting canonical path, so retargeting the original alias
      * cannot move storage after cohort admission. */
     bool cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
-    if (!cache_ready && cbm_mkdir_p(cache, 0700)) {
+    if (!cache_ready && !read_only && cbm_mkdir_p(cache, 0700)) {
         cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
     }
     if (!cache_ready || !cbm_is_dir(canonical_cache)) {
@@ -1097,7 +1098,9 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * owner-only path by the same already-compromised OS account is outside
      * the v1 threat boundary; cross-account and unsafe filesystem states fail
      * here before any daemon/cohort state is opened. */
-    if (!cbm_daemon_ipc_private_directory_secure(canonical_cache)) {
+    bool cache_private = read_only ? cbm_daemon_ipc_private_directory_validate(canonical_cache)
+                                   : cbm_daemon_ipc_private_directory_secure(canonical_cache);
+    if (!cache_private) {
         return MAIN_BUILD_IDENTITY_CACHE_PRIVATE;
     }
     /* Every cache consumer in this process must use the exact path whose
@@ -1114,7 +1117,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
         .cache_fingerprint = cache_fingerprint,
         .protocol_abi = CBM_DAEMON_RUNTIME_WIRE_ABI,
         .store_abi = 1,
-        .feature_abi = 1,
+        .feature_abi = cbm_daemon_policy_feature_abi(),
     };
     return MAIN_BUILD_IDENTITY_OK;
 }
@@ -1422,6 +1425,11 @@ static char *main_hook_cwd(const char *input_json) {
  * brings one up. That state must be VISIBLE, not silent — but a notice per
  * tool call would nag, so a cache-scoped marker rate-limits it. */
 static bool main_hook_absent_notice_due(void) {
+    if (cbm_env_enabled("CBM_READ_ONLY")) {
+        /* Strict serving must not create or rewrite user-state markers. The
+         * notice remains visible on stderr without cache-scoped rate limiting. */
+        return true;
+    }
     const char *cache_dir = cbm_resolve_cache_dir();
     if (!cache_dir) {
         return false;
@@ -1544,6 +1552,10 @@ static void main_daemon_ctl_print_clients(const uint32_t *pids, uint8_t count, u
 }
 
 static void main_daemon_ctl_print_ui(void) {
+    if (cbm_env_enabled("CBM_READ_ONLY")) {
+        printf("  ui: disabled (read-only mode)\n");
+        return;
+    }
     if (CBM_EMBEDDED_FILE_COUNT == 0) {
         return;
     }
@@ -1581,6 +1593,7 @@ static void main_daemon_ctl_open_browser(int port) {
 static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpoint_t *endpoint,
                                const cbm_daemon_build_identity_t *identity,
                                const char *executable_path) {
+    bool read_only = cbm_env_enabled("CBM_READ_ONLY");
     const char *subcommand = NULL;
     bool open_browser = false;
     int requested_port = 0;
@@ -1705,7 +1718,11 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     /* The committed control connection satisfied the daemon's no-client
      * startup window; configure the UI before departing. */
     int ui_port = 0;
-    if (CBM_EMBEDDED_FILE_COUNT > 0) {
+    if (read_only) {
+        if (requested_port > 0 || open_browser) {
+            (void)fprintf(stderr, "warning: --port/--open have no effect in read-only mode\n");
+        }
+    } else if (CBM_EMBEDDED_FILE_COUNT > 0) {
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
         ui_port = requested_port > 0 ? requested_port : ui_config.ui_port;
@@ -1731,7 +1748,9 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
     printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
            "retires it.\n");
-    if (CBM_EMBEDDED_FILE_COUNT > 0) {
+    if (read_only) {
+        printf("  ui: disabled (read-only mode)\n");
+    } else if (CBM_EMBEDDED_FILE_COUNT > 0) {
         printf("  ui: http://127.0.0.1:%d\n", ui_port);
         printf("  If this port is unavailable the daemon keeps retrying and logs the "
                "conflict; pass --port=N for a different port.\n");

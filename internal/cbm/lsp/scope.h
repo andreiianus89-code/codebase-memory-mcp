@@ -3,8 +3,7 @@
 
 #include "type_rep.h"
 #include "../arena.h"
-#include <stdatomic.h> /* relaxed cache for cbm_lsp_max_walk_depth */
-#include <stdlib.h>     /* getenv, atoi (cbm_lsp_max_walk_depth) */
+#include <stdatomic.h>
 
 typedef struct {
     const char* name;
@@ -39,22 +38,18 @@ typedef struct CBMScope {
 // CBM_LSP_MAX_WALK_DEPTH env var (positive integer).
 #define CBM_LSP_MAX_WALK_DEPTH 512
 
-// Resolved walk-depth cap: env override (CBM_LSP_MAX_WALK_DEPTH, if a positive
-// integer) else CBM_LSP_MAX_WALK_DEPTH. Read once and cached — the walkers call
-// this per node, so it must not hit getenv on the hot path. The cache is
-// idempotent under multi-threaded indexing (every worker computes the same
-// value), but a plain data race is undefined behavior even when the values
-// agree, so the slot is a relaxed atomic: on the hot path this is a plain load
-// with no fence, and a first-touch double-compute simply stores the same
-// value. This keeps the parallel extractor TSan-clean.
+// The pipeline refreshes this process-wide effective value once per run. Direct
+// extractor callers lazily initialize it on first use. Walkers only pay one
+// relaxed atomic load per node, while a later pipeline in the same process can
+// safely pick up an environment change (required by the recipe fingerprint).
+extern _Atomic int cbm_lsp_walk_depth_effective;
+int cbm_lsp_configure_max_walk_depth(void);
+
 static inline int cbm_lsp_max_walk_depth(void) {
-    static _Atomic int cached = -1;
-    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    int value =
+        atomic_load_explicit(&cbm_lsp_walk_depth_effective, memory_order_relaxed);
     if (value < 0) {
-        const char* e = getenv("CBM_LSP_MAX_WALK_DEPTH");
-        int v = (e && *e) ? atoi(e) : 0;
-        value = (v > 0) ? v : CBM_LSP_MAX_WALK_DEPTH;
-        atomic_store_explicit(&cached, value, memory_order_relaxed);
+        value = cbm_lsp_configure_max_walk_depth();
     }
     return value;
 }

@@ -29,6 +29,24 @@ _Noreturn void cbm_daemon_host_force_terminate_for_test(const char *component);
 bool cbm_daemon_host_state_prepare_for_test(const struct cbm_daemon_ipc_endpoint *endpoint);
 
 typedef struct {
+    bool read_only;
+    bool application_created;
+    bool runtime_config_opened;
+    bool watch_store_opened;
+    bool project_locks_created;
+    bool watcher_created;
+    bool watcher_thread_started;
+    bool http_server_created;
+    bool http_thread_started;
+} cbm_daemon_host_read_only_probe_result_t;
+
+/* Prepare and start background services through the production host paths,
+ * then report every mutable/background surface before ordinary cleanup. */
+bool cbm_daemon_host_read_only_startup_probe_for_test(
+    const struct cbm_daemon_ipc_endpoint *endpoint,
+    cbm_daemon_host_read_only_probe_result_t *result_out);
+
+typedef struct {
     size_t config_loads;
     size_t server_create_attempts;
     size_t thread_start_attempts;

@@ -5,6 +5,7 @@
  * on a temporary directory with known file layout.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -14,6 +15,7 @@
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
+#include "foundation/sha256.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -5573,6 +5575,15 @@ typedef struct {
     bool staging_was_valid;
 } publish_observe_ctx_t;
 
+#ifndef _WIN32
+typedef struct {
+    const char *source_path;
+    char staging_path[CBM_SZ_4K];
+    int calls;
+    bool short_read_observed;
+} publish_late_read_ctx_t;
+#endif
+
 static void observe_publish_boundary(cbm_pipeline_t *p, const char *staging_path, void *arg) {
     (void)p;
     publish_observe_ctx_t *ctx = (publish_observe_ctx_t *)arg;
@@ -5591,6 +5602,24 @@ static void observe_publish_boundary(cbm_pipeline_t *p, const char *staging_path
         cbm_store_close(staging);
     }
 }
+
+#ifndef _WIN32
+static void fail_parser_read_at_publish(cbm_pipeline_t *p, const char *staging_path, void *arg) {
+    publish_late_read_ctx_t *ctx = (publish_late_read_ctx_t *)arg;
+    ctx->calls++;
+    if (staging_path) {
+        (void)snprintf(ctx->staging_path, sizeof(ctx->staging_path), "%s", staging_path);
+    }
+    FILE *source = cbm_fopen(ctx->source_path, "rb");
+    if (!source) {
+        return;
+    }
+    unsigned char bytes[2];
+    cbm_pipeline_set_parser_read_limit_for_tests(p, 1);
+    ctx->short_read_observed = !cbm_pipeline_fread_exact(p, source, bytes, sizeof(bytes));
+    (void)fclose(source);
+}
+#endif
 
 typedef struct {
     int calls;
@@ -5651,6 +5680,24 @@ static bool sqlite_artifacts_absent(const char *db_path) {
     snprintf(sidecar, sizeof(sidecar), "%s-journal", db_path);
     return stat(sidecar, &st) != 0;
 }
+
+#ifndef _WIN32
+static bool sqlite_sidecars_absent(const char *db_path) {
+    if (!db_path || !db_path[0]) {
+        return false;
+    }
+    static const char *const suffixes[] = {"-wal", "-shm", "-journal"};
+    char sidecar[832];
+    struct stat st;
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        int n = snprintf(sidecar, sizeof(sidecar), "%s%s", db_path, suffixes[i]);
+        if (n < 0 || (size_t)n >= sizeof(sidecar) || stat(sidecar, &st) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 static bool write_go_file(const char *dir, const char *name, const char *source) {
     char path[512];
@@ -5774,6 +5821,14 @@ TEST(incremental_detects_changed_file) {
     char *project = strdup(cbm_pipeline_project_name(p));
     cbm_pipeline_free(p);
 
+    char generation_before[96];
+    cbm_store_t *s = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_generation(s, generation_before, sizeof(generation_before)),
+              CBM_STORE_OK);
+    ASSERT_STR_NEQ(generation_before, "legacy");
+    cbm_store_close(s);
+
     /* Modify helper.go — add a new function */
     char path[512];
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
@@ -5790,10 +5845,14 @@ TEST(incremental_detects_changed_file) {
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     /* Verify node count increased (NewFunc was added) */
-    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    s = cbm_store_open_path_query(g_incr_dbpath);
     ASSERT_NOT_NULL(s);
     int nodes_after = cbm_store_count_nodes(s, project);
     ASSERT_GT(nodes_after, 0);
+    char generation_after[96];
+    ASSERT_EQ(cbm_store_generation(s, generation_after, sizeof(generation_after)), CBM_STORE_OK);
+    ASSERT_STR_NEQ(generation_after, "legacy");
+    ASSERT_STR_NEQ(generation_before, generation_after);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);
@@ -6370,6 +6429,727 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     free(project);
     th_rmtree(tmpdir);
     PASS();
+}
+
+#ifndef _WIN32
+static bool tracked_snapshot_digest_valid(const char *digest) {
+    if (!digest || strlen(digest) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (int i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((digest[i] >= '0' && digest[i] <= '9') ||
+              (digest[i] >= 'a' && digest[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const cbm_file_hash_t *tracked_snapshot_find_hash(const cbm_file_hash_t *hashes, int count,
+                                                         const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (hashes[i].rel_path && strcmp(hashes[i].rel_path, rel_path) == 0) {
+            return &hashes[i];
+        }
+    }
+    return NULL;
+}
+
+static const cbm_coverage_row_t *tracked_snapshot_find_coverage(
+    const cbm_coverage_row_t *coverage, int count, const char *rel_path, const char *kind) {
+    for (int i = 0; i < count; i++) {
+        if (coverage[i].rel_path && coverage[i].kind &&
+            strcmp(coverage[i].rel_path, rel_path) == 0 &&
+            strcmp(coverage[i].kind, kind) == 0) {
+            return &coverage[i];
+        }
+    }
+    return NULL;
+}
+
+static bool tracked_snapshot_add_stale_node(cbm_store_t *store, const char *project) {
+    cbm_node_t stale = {
+        .project = project,
+        .label = "Function",
+        .name = "TrustStale",
+        .qualified_name = "trust-test.stale.TrustStale",
+        .file_path = "stale.go",
+        .properties_json = "{}",
+    };
+    return cbm_store_upsert_node(store, &stale) > 0;
+}
+
+typedef struct {
+    const char *replacement_path;
+    int calls;
+    bool replaced;
+} tracked_noop_replace_ctx_t;
+
+static void tracked_noop_replace_final(cbm_pipeline_t *pipeline, const char *final_path,
+                                       void *opaque) {
+    (void)pipeline;
+    tracked_noop_replace_ctx_t *context = opaque;
+    context->calls++;
+    context->replaced =
+        cbm_rename_replace(context->replacement_path, final_path) == 0;
+}
+
+static bool run_tracked_snapshot_integration(void) {
+    bool ok = false;
+    char tmpdir[256] = {0};
+    char default_db[512] = {0};
+    char tracked_db[512] = {0};
+    char path[512] = {0};
+    char deep_aux_rel[512] = {0};
+    char deep_aux_path[768] = {0};
+    char cmd[2048] = {0};
+    cbm_pipeline_t *p = NULL;
+    cbm_store_t *store = NULL;
+    cbm_node_t *nodes = NULL;
+    cbm_node_t branch = {0};
+    cbm_node_t project_node = {0};
+    cbm_file_hash_t *hashes = NULL;
+    cbm_coverage_row_t *coverage = NULL;
+    cbm_coverage_meta_t coverage_meta = {0};
+    int node_count = 0;
+    int hash_count = 0;
+    int coverage_count = 0;
+    char *project = NULL;
+    char *branch_qn = NULL;
+    cbm_git_context_t git_ctx = {0};
+    const char *existing_env = getenv("CBM_GIT_TRACKED_ONLY");
+    char *saved_env = existing_env ? strdup(existing_env) : NULL;
+    const char *existing_lsp_env = getenv("CBM_DISABLE_LSP_CROSS");
+    char *saved_lsp_env = existing_lsp_env ? strdup(existing_lsp_env) : NULL;
+    const char *existing_ts_lsp_env = getenv("CBM_LSP_DISABLED");
+    char *saved_ts_lsp_env =
+        existing_ts_lsp_env ? strdup(existing_ts_lsp_env) : NULL;
+    const char *failure = "setup";
+    if ((existing_env && !saved_env) ||
+        (existing_lsp_env && !saved_lsp_env) ||
+        (existing_ts_lsp_env && !saved_ts_lsp_env)) {
+        free(saved_env);
+        free(saved_lsp_env);
+        free(saved_ts_lsp_env);
+        return false;
+    }
+
+#define TRACKED_CHECK(expr, phase) \
+    do {                           \
+        if (!(expr)) {             \
+            failure = (phase);     \
+            goto cleanup;          \
+        }                          \
+    } while (0)
+
+    char *tmp = th_mktempdir("cbm_tracked_snapshot");
+    TRACKED_CHECK(tmp != NULL, "tmpdir");
+    snprintf(tmpdir, sizeof(tmpdir), "%s", tmp);
+    snprintf(default_db, sizeof(default_db), "%s/default.db", tmpdir);
+    snprintf(tracked_db, sizeof(tracked_db), "%s/tracked.db", tmpdir);
+
+    snprintf(path, sizeof(path), "%s/tools", tmpdir);
+    TRACKED_CHECK(th_mkdir_p(path) == 0, "mkdir tools");
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    TRACKED_CHECK(th_write_file(path, "package main\n\nfunc main() {}\n") == 0, "write main");
+    snprintf(path, sizeof(path), "%s/tools/util.go", tmpdir);
+    TRACKED_CHECK(th_write_file(path, "package tools\n\nfunc Util() string { return \"u\" }\n") == 0,
+                  "write tools");
+    snprintf(path, sizeof(path), "%s/scratch.go", tmpdir);
+    TRACKED_CHECK(th_write_file(path, "package scratch\n\nfunc Scratch() {}\n") == 0,
+                  "write scratch");
+    snprintf(path, sizeof(path), "%s/notes.cbmunsupported", tmpdir);
+    TRACKED_CHECK(th_write_file(path, "tracked but intentionally unsupported\n") == 0,
+                  "write unsupported");
+    snprintf(path, sizeof(path), "%s/config", tmpdir);
+    TRACKED_CHECK(th_mkdir_p(path) == 0, "mkdir config");
+    snprintf(path, sizeof(path), "%s/config/package.json", tmpdir);
+    TRACKED_CHECK(th_write_file(path, "{\"name\":\"trust-fixture\",\"version\":\"1\"}\n") == 0,
+                  "write auxiliary");
+    for (int i = 0; i < 33; i++) {
+        char component[16];
+        snprintf(component, sizeof(component), "d%02d/", i);
+        TRACKED_CHECK(strlen(deep_aux_rel) + strlen(component) +
+                              strlen("tsconfig.json") + 1 <
+                          sizeof(deep_aux_rel),
+                      "deep auxiliary relative path capacity");
+        strcat(deep_aux_rel, component);
+    }
+    strcat(deep_aux_rel, "tsconfig.json");
+    snprintf(deep_aux_path, sizeof(deep_aux_path), "%s/%s", tmpdir,
+             deep_aux_rel);
+    snprintf(path, sizeof(path), "%s", deep_aux_path);
+    char *deep_aux_slash = strrchr(path, '/');
+    TRACKED_CHECK(deep_aux_slash != NULL, "deep auxiliary parent");
+    *deep_aux_slash = '\0';
+    TRACKED_CHECK(th_mkdir_p(path) == 0, "mkdir deep auxiliary");
+    TRACKED_CHECK(th_write_file(deep_aux_path,
+                                "{\"compilerOptions\":{\"baseUrl\":\".\"}}\n") ==
+                      0,
+                  "write depth-excluded auxiliary");
+
+    const char *null_dev = test_null_dev();
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" init -q >%s 2>&1", tmpdir, null_dev);
+    TRACKED_CHECK(run_cmd(cmd) == 0, "git init");
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" add main.go tools/util.go notes.cbmunsupported "
+             "config/package.json \"%s\" >%s 2>&1",
+             tmpdir, deep_aux_rel, null_dev);
+    TRACKED_CHECK(run_cmd(cmd) == 0, "git add");
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" -c user.email=\"cbm@example.invalid\" "
+             "commit -q -m initial >%s 2>&1",
+             tmpdir, null_dev);
+    TRACKED_CHECK(run_cmd(cmd) == 0, "git initial commit");
+
+    /* Default-off compatibility: an untracked source remains indexable. */
+    TRACKED_CHECK(cbm_unsetenv("CBM_GIT_TRACKED_ONLY") == 0, "unset tracked env");
+    TRACKED_CHECK(cbm_unsetenv("CBM_DISABLE_LSP_CROSS") == 0, "normalize lsp recipe");
+    TRACKED_CHECK(cbm_unsetenv("CBM_LSP_DISABLED") == 0,
+                  "normalize ts lsp recipe");
+    p = cbm_pipeline_new(tmpdir, default_db, CBM_MODE_FULL);
+    TRACKED_CHECK(p != NULL, "default pipeline");
+    project = strdup(cbm_pipeline_project_name(p));
+    TRACKED_CHECK(project != NULL, "project name");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "default full index");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(default_db);
+    TRACKED_CHECK(store != NULL, "open default db");
+    TRACKED_CHECK(cbm_store_find_nodes_by_file(store, project, "scratch.go", &nodes,
+                                               &node_count) == CBM_STORE_OK,
+                  "query default scratch");
+    TRACKED_CHECK(node_count > 0, "default preserves untracked behavior");
+    cbm_store_free_nodes(nodes, node_count);
+    nodes = NULL;
+    node_count = 0;
+    TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK &&
+                      hash_count > 0,
+                  "load default hashes");
+    for (int i = 0; i < hash_count; i++) {
+        TRACKED_CHECK(hashes[i].sha256 && hashes[i].sha256[0] == '\0',
+                      "default digest remains blank");
+    }
+    cbm_store_free_file_hashes(hashes, hash_count);
+    hashes = NULL;
+    hash_count = 0;
+    char default_generation[96];
+    TRACKED_CHECK(cbm_store_generation(store, default_generation,
+                                       sizeof(default_generation)) == CBM_STORE_OK,
+                  "default generation");
+    cbm_store_close(store);
+    store = NULL;
+    p = cbm_pipeline_new(tmpdir, default_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL && cbm_pipeline_get_mode(p) == CBM_MODE_FAST,
+                  "default fast mode unchanged");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "default unchanged incremental");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(default_db);
+    TRACKED_CHECK(store != NULL, "open default unchanged db");
+    char default_generation_after[96];
+    TRACKED_CHECK(cbm_store_generation(store, default_generation_after,
+                                       sizeof(default_generation_after)) == CBM_STORE_OK &&
+                      strcmp(default_generation, default_generation_after) == 0,
+                  "default unchanged generation");
+    TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK,
+                  "reload default hashes");
+    for (int i = 0; i < hash_count; i++) {
+        TRACKED_CHECK(hashes[i].sha256 && hashes[i].sha256[0] == '\0',
+                      "default digest still blank");
+    }
+    cbm_store_free_file_hashes(hashes, hash_count);
+    hashes = NULL;
+    hash_count = 0;
+    cbm_store_close(store);
+    store = NULL;
+
+    /* Opt-in full snapshot: only tracked/indexable files and real digests. */
+    TRACKED_CHECK(cbm_setenv("CBM_GIT_TRACKED_ONLY", "1", 1) == 0, "set tracked env");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FULL);
+    TRACKED_CHECK(p != NULL, "tracked pipeline");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "tracked full index");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open tracked db");
+    TRACKED_CHECK(cbm_store_find_nodes_by_file(store, project, "scratch.go", &nodes,
+                                               &node_count) == CBM_STORE_OK,
+                  "query tracked scratch");
+    TRACKED_CHECK(node_count == 0, "untracked file excluded");
+    cbm_store_free_nodes(nodes, node_count);
+    nodes = NULL;
+    TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK,
+                  "load full hashes");
+    TRACKED_CHECK(hash_count == 3, "tracked hash count");
+    const cbm_file_hash_t *main_hash =
+        tracked_snapshot_find_hash(hashes, hash_count, "main.go");
+    const cbm_file_hash_t *tools_hash =
+        tracked_snapshot_find_hash(hashes, hash_count, "tools/util.go");
+    const cbm_file_hash_t *aux_hash =
+        tracked_snapshot_find_hash(hashes, hash_count, "config/package.json");
+    TRACKED_CHECK(main_hash && tracked_snapshot_digest_valid(main_hash->sha256),
+                  "main digest format");
+    TRACKED_CHECK(tools_hash && tracked_snapshot_digest_valid(tools_hash->sha256),
+                  "tools digest format");
+    TRACKED_CHECK(aux_hash && tracked_snapshot_digest_valid(aux_hash->sha256),
+                  "auxiliary digest format");
+    char initial_aux_digest[CBM_SHA256_HEX_LEN + 1];
+    snprintf(initial_aux_digest, sizeof(initial_aux_digest), "%s", aux_hash->sha256);
+    char expected_digest[CBM_SHA256_HEX_LEN + 1];
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    TRACKED_CHECK(cbm_sha256_file(path, expected_digest) == 0, "hash main fixture");
+    TRACKED_CHECK(strcmp(main_hash->sha256, expected_digest) == 0, "main digest value");
+    cbm_store_free_file_hashes(hashes, hash_count);
+    hashes = NULL;
+    hash_count = 0;
+    TRACKED_CHECK(
+        cbm_store_coverage_get(store, project, &coverage, &coverage_count) == CBM_STORE_OK,
+        "load full coverage");
+    TRACKED_CHECK(tracked_snapshot_find_coverage(
+                      coverage, coverage_count, "notes.cbmunsupported", "not_indexed_file") != NULL,
+                  "unsupported tracked path coverage");
+    int exact_exclusion_count = 0;
+    for (int i = 0; i < coverage_count; i++) {
+        if (coverage[i].kind && strcmp(coverage[i].kind, "not_indexed_file") == 0) {
+            exact_exclusion_count++;
+            TRACKED_CHECK(coverage[i].rel_path &&
+                              (strcmp(coverage[i].rel_path, "notes.cbmunsupported") == 0 ||
+                               strcmp(coverage[i].rel_path, deep_aux_rel) == 0),
+                          "tracked corpus has no extra exact exclusions");
+        }
+    }
+    /* Exact corpus invariant for this fixture:
+     * hashes(main.go, tools/util.go, package.json) U exact exclusions(notes,
+     * depth-capped tsconfig) == git ls-files. */
+    TRACKED_CHECK(exact_exclusion_count == 2, "tracked corpus exact union");
+    cbm_store_free_coverage(coverage, coverage_count);
+    coverage = NULL;
+    coverage_count = 0;
+    TRACKED_CHECK(cbm_store_coverage_meta_get(store, project, &coverage_meta) == CBM_STORE_OK,
+                  "load coverage metadata");
+    TRACKED_CHECK(coverage_meta.index_mode &&
+                      strcmp(coverage_meta.index_mode, "full") == 0 &&
+                      coverage_meta.recording_status &&
+                      strcmp(coverage_meta.recording_status, "complete") == 0 &&
+                      coverage_meta.ignored_files_stored == 2 &&
+                      coverage_meta.ignored_files_total == 2 &&
+                      coverage_meta.hash_records_complete,
+                  "complete tracked coverage metadata");
+    cbm_store_coverage_meta_clear(&coverage_meta);
+
+    /* Compatibility regression: an older generation may have persisted a
+     * recognized auxiliary beyond the canonical depth cap. It is not a graph
+     * input now, so the same trusted snapshot must remain admissible instead
+     * of entering a permanent rebuild loop. */
+    char deep_aux_digest[CBM_SHA256_HEX_LEN + 1];
+    struct stat deep_aux_stat;
+    TRACKED_CHECK(cbm_sha256_file(deep_aux_path, deep_aux_digest) == 0 &&
+                      stat(deep_aux_path, &deep_aux_stat) == 0,
+                  "hash legacy deep auxiliary");
+    TRACKED_CHECK(cbm_store_upsert_file_hash(
+                      store, project, deep_aux_rel, deep_aux_digest, 0,
+                      (int64_t)deep_aux_stat.st_size) == CBM_STORE_OK,
+                  "seed legacy depth-excluded auxiliary hash");
+    TRACKED_CHECK(cbm_store_prepare_for_publish(store) == CBM_STORE_OK,
+                  "seal legacy auxiliary fixture");
+
+    /* Identical tracked corpus + Git + recipe is a true no-op: the published
+     * database generation and file identity remain untouched. */
+    char tracked_generation[96];
+    TRACKED_CHECK(cbm_store_generation(store, tracked_generation,
+                                       sizeof(tracked_generation)) == CBM_STORE_OK,
+                  "tracked generation before noop");
+    cbm_store_close(store);
+    store = NULL;
+    struct stat tracked_before;
+    struct stat tracked_after;
+    TRACKED_CHECK(stat(tracked_db, &tracked_before) == 0,
+                  "stat tracked before noop");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL, "trusted noop pipeline");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "trusted noop run");
+    cbm_pipeline_free(p);
+    p = NULL;
+    TRACKED_CHECK(stat(tracked_db, &tracked_after) == 0,
+                  "stat tracked after noop");
+    TRACKED_CHECK(tracked_before.st_dev == tracked_after.st_dev &&
+                      tracked_before.st_ino == tracked_after.st_ino &&
+                      tracked_before.st_size == tracked_after.st_size,
+                  "trusted noop preserves file identity");
+#ifdef __APPLE__
+    TRACKED_CHECK(tracked_before.st_mtimespec.tv_sec ==
+                          tracked_after.st_mtimespec.tv_sec &&
+                      tracked_before.st_mtimespec.tv_nsec ==
+                          tracked_after.st_mtimespec.tv_nsec,
+                  "trusted noop preserves mtime");
+#else
+    TRACKED_CHECK(tracked_before.st_mtim.tv_sec == tracked_after.st_mtim.tv_sec &&
+                      tracked_before.st_mtim.tv_nsec == tracked_after.st_mtim.tv_nsec,
+                  "trusted noop preserves mtime");
+#endif
+    store = cbm_store_open_path_query_strict(tracked_db);
+    TRACKED_CHECK(store != NULL, "open after trusted noop");
+    char tracked_generation_after[96];
+    TRACKED_CHECK(cbm_store_generation(store, tracked_generation_after,
+                                       sizeof(tracked_generation_after)) ==
+                          CBM_STORE_OK &&
+                      strcmp(tracked_generation, tracked_generation_after) == 0,
+                  "trusted noop preserves generation");
+
+    /* A parser short-read is fatal in trusted mode. The candidate must not
+     * replace or even byte-modify the last committed generation. */
+    cbm_store_close(store);
+    store = NULL;
+    char db_digest_before_short[CBM_SHA256_HEX_LEN + 1];
+    char db_digest_after_short[CBM_SHA256_HEX_LEN + 1];
+    TRACKED_CHECK(cbm_sha256_file(tracked_db, db_digest_before_short) == 0,
+                  "hash db before parser short read");
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    TRACKED_CHECK(th_write_file(path,
+                                "package main\n\nfunc main() { println(\"short-read\") }\n") == 0,
+                  "mutate main before parser short read");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FULL);
+    TRACKED_CHECK(p != NULL, "parser short-read pipeline");
+    cbm_pipeline_set_parser_read_limit_for_tests(p, 1);
+    int short_read_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    p = NULL;
+    TRACKED_CHECK(th_write_file(path, "package main\n\nfunc main() {}\n") == 0,
+                  "restore main after parser short read");
+    TRACKED_CHECK(short_read_rc == CBM_PIPELINE_ABORT_PRESERVE_DB,
+                  "parser short read aborts and preserves db");
+    TRACKED_CHECK(cbm_sha256_file(tracked_db, db_digest_after_short) == 0 &&
+                      strcmp(db_digest_before_short, db_digest_after_short) == 0,
+                  "parser short read preserves exact db bytes");
+    store = cbm_store_open_path_query_strict(tracked_db);
+    TRACKED_CHECK(store != NULL, "open db after parser short read");
+    char generation_after_short[96];
+    TRACKED_CHECK(cbm_store_generation(store, generation_after_short,
+                                       sizeof(generation_after_short)) == CBM_STORE_OK &&
+                      strcmp(tracked_generation, generation_after_short) == 0,
+                  "parser short read preserves generation");
+    cbm_store_close(store);
+    store = NULL;
+    cbm_dir_t *short_read_dir = cbm_opendir(tmpdir);
+    TRACKED_CHECK(short_read_dir != NULL, "open repo after parser short read");
+    bool short_read_stage_absent = true;
+    cbm_dirent_t *short_read_entry = NULL;
+    static const char short_read_stage_prefix[] = "tracked.db.stage.";
+    while ((short_read_entry = cbm_readdir(short_read_dir)) != NULL) {
+        if (strncmp(short_read_entry->name, short_read_stage_prefix,
+                    sizeof(short_read_stage_prefix) - 1) == 0) {
+            short_read_stage_absent = false;
+            break;
+        }
+    }
+    cbm_closedir(short_read_dir);
+    TRACKED_CHECK(short_read_stage_absent, "parser short-read staging cleaned");
+
+    /* Defense in depth: a trusted parser read that fails after extraction but
+     * before publication must still trip the final latch gate. This seam makes
+     * the otherwise unreachable phase ordering deterministic. */
+    char db_digest_before_late_read[CBM_SHA256_HEX_LEN + 1];
+    char db_digest_after_late_read[CBM_SHA256_HEX_LEN + 1];
+    TRACKED_CHECK(cbm_sha256_file(tracked_db, db_digest_before_late_read) == 0 &&
+                      sqlite_sidecars_absent(tracked_db),
+                  "snapshot sealed before late parser short read");
+    TRACKED_CHECK(th_write_file(path,
+                                "package main\n\nfunc main() { println(\"late-short-read\") }\n") == 0,
+                  "mutate main before late parser short read");
+    publish_late_read_ctx_t late_read = {.source_path = path};
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FULL);
+    TRACKED_CHECK(p != NULL, "late parser short-read pipeline");
+    cbm_pipeline_set_before_publish_hook_for_tests(p, fail_parser_read_at_publish,
+                                                   &late_read);
+    int late_read_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    p = NULL;
+    TRACKED_CHECK(th_write_file(path, "package main\n\nfunc main() {}\n") == 0,
+                  "restore main after late parser short read");
+    TRACKED_CHECK(late_read_rc == CBM_PIPELINE_ABORT_PRESERVE_DB && late_read.calls == 1 &&
+                      late_read.short_read_observed,
+                  "late parser short read aborts at publish gate");
+    TRACKED_CHECK(cbm_sha256_file(tracked_db, db_digest_after_late_read) == 0 &&
+                      strcmp(db_digest_before_late_read, db_digest_after_late_read) == 0 &&
+                      sqlite_sidecars_absent(tracked_db),
+                  "late parser short read preserves db bytes and sidecar family");
+    store = cbm_store_open_path_query_strict(tracked_db);
+    TRACKED_CHECK(store != NULL, "open db after late parser short read");
+    char generation_after_late_read[96];
+    TRACKED_CHECK(cbm_store_generation(store, generation_after_late_read,
+                                       sizeof(generation_after_late_read)) == CBM_STORE_OK &&
+                      strcmp(tracked_generation, generation_after_late_read) == 0,
+                  "late parser short read preserves generation");
+    cbm_store_close(store);
+    store = NULL;
+    TRACKED_CHECK(sqlite_artifacts_absent(late_read.staging_path),
+                  "late parser short-read staging cleaned");
+
+    /* Replacing the published path after all no-op reads but before the
+     * strict identity postgate must invalidate the no-op and force a clean
+     * rebuild. The injected replacement is otherwise a valid trusted DB with
+     * one stale graph node, so accepting it would be observable. */
+    char noop_replacement[512];
+    snprintf(noop_replacement, sizeof(noop_replacement), "%s/noop-replacement.db", tmpdir);
+    TRACKED_CHECK(cbm_store_backup_path(tracked_db, noop_replacement) == CBM_STORE_OK,
+                  "prepare no-op replacement");
+    store = cbm_store_open_path(noop_replacement);
+    TRACKED_CHECK(store != NULL, "open no-op replacement");
+    TRACKED_CHECK(tracked_snapshot_add_stale_node(store, project),
+                  "seed no-op replacement");
+    cbm_store_close(store);
+    store = NULL;
+    tracked_noop_replace_ctx_t noop_replace = {
+        .replacement_path = noop_replacement,
+    };
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL, "replacement no-op pipeline");
+    cbm_pipeline_set_before_trusted_noop_hook_for_tests(
+        p, tracked_noop_replace_final, &noop_replace);
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "replacement invalidates no-op");
+    cbm_pipeline_free(p);
+    p = NULL;
+    TRACKED_CHECK(noop_replace.calls == 1 && noop_replace.replaced,
+                  "replacement hook ran");
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open rebuilt replacement target");
+    TRACKED_CHECK(count_nodes_named(store, project, "TrustStale") == 0,
+                  "replacement was rebuilt, not accepted as no-op");
+
+    TRACKED_CHECK(tracked_snapshot_add_stale_node(store, project), "insert stale before source");
+    cbm_store_close(store);
+    store = NULL;
+
+    /* Trust mode forces a FAST request through a clean FULL build. */
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    TRACKED_CHECK(
+        th_write_file(path, "package main\n\nfunc main() { println(\"changed\") }\n") == 0,
+        "mutate main");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL, "fast pipeline");
+    TRACKED_CHECK(cbm_pipeline_get_mode(p) == CBM_MODE_FULL, "fast request forced full");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "forced full after source change");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open fast db");
+    TRACKED_CHECK(cbm_store_find_nodes_by_file(store, project, "tools/util.go", &nodes,
+                                               &node_count) == CBM_STORE_OK,
+                  "query preserved tools");
+    TRACKED_CHECK(node_count > 0, "tracked mode-skipped file preserved");
+    cbm_store_free_nodes(nodes, node_count);
+    nodes = NULL;
+    node_count = 0;
+    TRACKED_CHECK(count_nodes_named(store, project, "TrustStale") == 0,
+                  "source change used clean full");
+    TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK,
+                  "load fast hashes");
+    main_hash = tracked_snapshot_find_hash(hashes, hash_count, "main.go");
+    tools_hash = tracked_snapshot_find_hash(hashes, hash_count, "tools/util.go");
+    TRACKED_CHECK(main_hash && tools_hash && tracked_snapshot_digest_valid(main_hash->sha256) &&
+                      tracked_snapshot_digest_valid(tools_hash->sha256),
+                  "incremental real digests");
+    cbm_store_free_file_hashes(hashes, hash_count);
+    hashes = NULL;
+    hash_count = 0;
+    cbm_store_close(store);
+    store = NULL;
+
+    /* An auxiliary-only change is graph-shaping and also forces clean FULL. */
+    snprintf(path, sizeof(path), "%s/config/package.json", tmpdir);
+    TRACKED_CHECK(th_write_file(path, "{\"name\":\"trust-fixture\",\"version\":\"2\"}\n") == 0,
+                  "mutate auxiliary");
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open before auxiliary change");
+    TRACKED_CHECK(tracked_snapshot_add_stale_node(store, project), "insert stale before auxiliary");
+    cbm_store_close(store);
+    store = NULL;
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_MODERATE);
+    TRACKED_CHECK(p != NULL, "moderate pipeline");
+    TRACKED_CHECK(cbm_pipeline_get_mode(p) == CBM_MODE_FULL, "moderate request forced full");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "forced full after auxiliary change");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open auxiliary db");
+    TRACKED_CHECK(count_nodes_named(store, project, "TrustStale") == 0,
+                  "auxiliary change used clean full");
+    TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK,
+                  "load auxiliary hashes");
+    aux_hash = tracked_snapshot_find_hash(hashes, hash_count, "config/package.json");
+    TRACKED_CHECK(aux_hash && tracked_snapshot_digest_valid(aux_hash->sha256) &&
+                      strcmp(aux_hash->sha256, initial_aux_digest) != 0,
+                  "auxiliary digest refreshed");
+    cbm_store_free_file_hashes(hashes, hash_count);
+    hashes = NULL;
+    hash_count = 0;
+    TRACKED_CHECK(tracked_snapshot_add_stale_node(store, project),
+                  "insert stale before recipe change");
+    cbm_store_close(store);
+    store = NULL;
+
+    /* A graph-shaping recipe flag change invalidates an otherwise identical
+     * source/Git snapshot and forces a clean FULL rebuild. */
+    TRACKED_CHECK(cbm_setenv("CBM_DISABLE_LSP_CROSS", "1", 1) == 0,
+                  "change lsp recipe");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL, "recipe pipeline");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "forced full after recipe change");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open recipe db");
+    TRACKED_CHECK(count_nodes_named(store, project, "TrustStale") == 0,
+                  "recipe change used clean full");
+    TRACKED_CHECK(cbm_store_find_node_by_qn(store, project, project, &project_node) ==
+                          CBM_STORE_OK &&
+                      project_node.properties_json &&
+                      strstr(project_node.properties_json, "index_recipe_sha256") != NULL,
+                  "recipe fingerprint persisted");
+    cbm_node_free_fields(&project_node);
+    memset(&project_node, 0, sizeof(project_node));
+    cbm_store_close(store);
+    store = NULL;
+
+    /* Representative extractor-runtime knob: its raw effective setting is
+     * recipe-bound, so an env flip invalidates an otherwise identical graph. */
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open before extractor recipe change");
+    TRACKED_CHECK(tracked_snapshot_add_stale_node(store, project),
+                  "insert stale before extractor recipe change");
+    cbm_store_close(store);
+    store = NULL;
+    TRACKED_CHECK(cbm_setenv("CBM_LSP_DISABLED", "1", 1) == 0,
+                  "change extractor recipe");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL, "extractor recipe pipeline");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0,
+                  "forced full after extractor recipe change");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open extractor recipe db");
+    TRACKED_CHECK(count_nodes_named(store, project, "TrustStale") == 0,
+                  "extractor recipe change used clean full");
+    cbm_store_close(store);
+    store = NULL;
+
+    /* De-track tools/util.go but leave it on disk: tracked-only deletion is
+     * authoritative and must purge the old graph/hash row. */
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rm -q --cached tools/util.go >%s 2>&1", tmpdir,
+             null_dev);
+    TRACKED_CHECK(run_cmd(cmd) == 0, "git rm cached");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL, "detracked pipeline");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "forced full after detrack");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open detracked db");
+    TRACKED_CHECK(cbm_store_find_nodes_by_file(store, project, "tools/util.go", &nodes,
+                                               &node_count) == CBM_STORE_OK,
+                  "query detracked tools");
+    TRACKED_CHECK(node_count == 0, "detracked on-disk file purged");
+    cbm_store_free_nodes(nodes, node_count);
+    nodes = NULL;
+    TRACKED_CHECK(cbm_store_get_file_hashes(store, project, &hashes, &hash_count) == CBM_STORE_OK,
+                  "load detracked hashes");
+    TRACKED_CHECK(hash_count == 2 &&
+                      tracked_snapshot_find_hash(hashes, hash_count, "tools/util.go") == NULL,
+                  "detracked hash purged");
+    cbm_store_free_file_hashes(hashes, hash_count);
+    hashes = NULL;
+    hash_count = 0;
+    cbm_store_close(store);
+    store = NULL;
+
+    /* A HEAD-only change is still a different trusted snapshot. */
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open before head change");
+    TRACKED_CHECK(tracked_snapshot_add_stale_node(store, project), "insert stale before head");
+    cbm_store_close(store);
+    store = NULL;
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" add main.go >%s 2>&1", tmpdir, null_dev);
+    TRACKED_CHECK(run_cmd(cmd) == 0, "stage main");
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" -c user.email=\"cbm@example.invalid\" "
+             "commit -q -m snapshot >%s 2>&1",
+             tmpdir, null_dev);
+    TRACKED_CHECK(run_cmd(cmd) == 0, "git snapshot commit");
+    TRACKED_CHECK(cbm_git_context_resolve(tmpdir, &git_ctx) == 0 && git_ctx.head_sha &&
+                      git_ctx.head_sha[0],
+                  "resolve new head");
+    branch_qn = cbm_git_context_branch_qn(project, &git_ctx);
+    TRACKED_CHECK(branch_qn != NULL, "branch qn");
+    p = cbm_pipeline_new(tmpdir, tracked_db, CBM_MODE_FAST);
+    TRACKED_CHECK(p != NULL, "metadata pipeline");
+    TRACKED_CHECK(cbm_pipeline_run(p) == 0, "forced full after head change");
+    cbm_pipeline_free(p);
+    p = NULL;
+    store = cbm_store_open_path(tracked_db);
+    TRACKED_CHECK(store != NULL, "open metadata db");
+    TRACKED_CHECK(cbm_store_find_node_by_qn(store, project, branch_qn, &branch) == CBM_STORE_OK,
+                  "load branch");
+    TRACKED_CHECK(branch.properties_json &&
+                      strstr(branch.properties_json, git_ctx.head_sha) != NULL,
+                  "branch head refreshed");
+    TRACKED_CHECK(count_nodes_named(store, project, "TrustStale") == 0,
+                  "head change used clean full");
+
+    ok = true;
+
+cleanup:
+    if (!ok) {
+        fprintf(stderr, "tracked snapshot integration failed at: %s\n", failure);
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    cbm_node_free_fields(&branch);
+    cbm_node_free_fields(&project_node);
+    cbm_store_free_file_hashes(hashes, hash_count);
+    cbm_store_free_coverage(coverage, coverage_count);
+    cbm_store_coverage_meta_clear(&coverage_meta);
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(p);
+    cbm_git_context_free(&git_ctx);
+    free(branch_qn);
+    free(project);
+    if (saved_env) {
+        (void)cbm_setenv("CBM_GIT_TRACKED_ONLY", saved_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_GIT_TRACKED_ONLY");
+    }
+    if (saved_lsp_env) {
+        (void)cbm_setenv("CBM_DISABLE_LSP_CROSS", saved_lsp_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_DISABLE_LSP_CROSS");
+    }
+    if (saved_ts_lsp_env) {
+        (void)cbm_setenv("CBM_LSP_DISABLED", saved_ts_lsp_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_LSP_DISABLED");
+    }
+    free(saved_env);
+    free(saved_lsp_env);
+    free(saved_ts_lsp_env);
+    if (tmpdir[0]) {
+        th_rmtree(tmpdir);
+    }
+    return ok;
+
+#undef TRACKED_CHECK
+}
+#endif /* !_WIN32 */
+
+TEST(pipeline_git_tracked_snapshot_and_branch_refresh) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-backed pipeline snapshot test not supported on Windows CI");
+#else
+    ASSERT_TRUE(run_tracked_snapshot_integration());
+    PASS();
+#endif /* _WIN32 */
 }
 
 TEST(incremental_k8s_manifest_indexed) {
@@ -7547,6 +8327,7 @@ SUITE(pipeline) {
     RUN_TEST(full_reindex_preserves_exact_long_db_path);
 #endif
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
+    RUN_TEST(pipeline_git_tracked_snapshot_and_branch_refresh);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);
     /* Resource management & internal helper tests */

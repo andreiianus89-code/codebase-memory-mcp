@@ -61,6 +61,29 @@ enum { TEST_PATH_CAP = 1024 };
 
 #ifndef _WIN32
 static bool ipc_test_write_byte(const char *path, unsigned char byte);
+
+static bool ipc_test_stat_metadata_equal(const struct stat *left, const struct stat *right) {
+    if (!left || !right) {
+        return false;
+    }
+#ifdef __APPLE__
+    bool timestamps_equal =
+        left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+        left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+        left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+        left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    bool timestamps_equal =
+        left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+        left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+        left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+        left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+    return timestamps_equal && left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino && left->st_mode == right->st_mode &&
+           left->st_uid == right->st_uid && left->st_gid == right->st_gid &&
+           left->st_size == right->st_size;
+}
 #endif
 
 static bool ipc_test_parent_new(char out[TEST_PATH_CAP], const char *tag) {
@@ -4412,6 +4435,65 @@ TEST(daemon_ipc_posix_private_directory_hardens_existing_cache_root) {
     PASS();
 }
 
+TEST(daemon_ipc_posix_private_directory_validation_never_repairs_or_creates) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    char missing[TEST_PATH_CAP] = {0};
+    struct stat secure_before = {0};
+    struct stat secure_after = {0};
+    struct stat public_before = {0};
+    struct stat public_after = {0};
+    bool paths_ok = false;
+    bool secure_created = false;
+    bool secure_validated_unchanged = false;
+    bool missing_rejected_unchanged = false;
+    bool public_rejected_unchanged = false;
+
+    if (ipc_test_parent_new(parent, "validate-only")) {
+        int cache_written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        int missing_written = snprintf(missing, sizeof(missing), "%s/missing", parent);
+        paths_ok = cache_written > 0 && cache_written < (int)sizeof(cache) &&
+                   missing_written > 0 && missing_written < (int)sizeof(missing);
+    }
+    if (paths_ok) {
+        secure_created = mkdir(cache, 0700) == 0;
+    }
+    if (secure_created && lstat(cache, &secure_before) == 0) {
+        bool validated = cbm_daemon_ipc_private_directory_validate(cache);
+        secure_validated_unchanged =
+            validated && lstat(cache, &secure_after) == 0 &&
+            ipc_test_stat_metadata_equal(&secure_before, &secure_after);
+    }
+    if (secure_validated_unchanged) {
+        errno = 0;
+        bool absent_before = lstat(missing, &secure_after) != 0 && errno == ENOENT;
+        bool rejected = !cbm_daemon_ipc_private_directory_validate(missing);
+        errno = 0;
+        bool absent_after = lstat(missing, &secure_after) != 0 && errno == ENOENT;
+        missing_rejected_unchanged = absent_before && rejected && absent_after;
+    }
+    if (missing_rejected_unchanged && chmod(cache, 0755) == 0 &&
+        lstat(cache, &public_before) == 0) {
+        bool rejected = !cbm_daemon_ipc_private_directory_validate(cache);
+        public_rejected_unchanged =
+            rejected && lstat(cache, &public_after) == 0 &&
+            ipc_test_stat_metadata_equal(&public_before, &public_after);
+    }
+
+    if (cache[0]) {
+        (void)chmod(cache, 0700);
+        (void)rmdir(cache);
+    }
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(secure_created);
+    ASSERT_TRUE(secure_validated_unchanged);
+    ASSERT_TRUE(missing_rejected_unchanged);
+    ASSERT_TRUE(public_rejected_unchanged);
+    PASS();
+}
+
 TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor) {
     char parent[TEST_PATH_CAP] = {0};
     char unsafe[TEST_PATH_CAP] = {0};
@@ -4667,6 +4749,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_runtime_and_socket_are_owner_only);
     RUN_TEST(daemon_ipc_posix_private_log_creates_first_ever_cache_tree_safely);
     RUN_TEST(daemon_ipc_posix_private_directory_hardens_existing_cache_root);
+    RUN_TEST(daemon_ipc_posix_private_directory_validation_never_repairs_or_creates);
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
